@@ -1,0 +1,18 @@
+[
+{
+    "name": "lightweightvk",
+    "source": {
+        "type": "git",
+        "url": "https://github.com/corporateshark/lightweightvk.git",
+        "revision": "321d8ff2508fc7404907fff7a7e4f983157bb148"
+    }
+},
+{
+    "name": "3D-Graphics-Rendering-Cookbook/data",
+    "source": {
+        "type": "sourcefile",
+        "url": "https://raw.githubusercontent.com/PacktPublishing/3D-Graphics-Rendering-Cookbook/e8bf80a2f4f2f9fafc49860f4d5b201101d42af8/data/OpenSans-Light.ttf",
+        "sha1": "40442c189568184b6e6c27a25d69f14d91b65039"
+    }
+}
+]

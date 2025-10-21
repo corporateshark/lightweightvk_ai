@@ -1,6 +1,6 @@
-deps/.bootstrap.json
-deps/archives/
-deps/src/
+third-party/.bootstrap.json
+third-party/archives/
+third-party/src/
 
 # Prerequisites
 *.d
