@@ -1,3 +1,7 @@
+deps/.bootstrap.json
+deps/archives/
+deps/src/
+
 # Prerequisites
 *.d
 
