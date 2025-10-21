@@ -34,3 +34,6 @@ macro(ADD_DEMO app)
   lvk_set_folder(${app} ${PROJECT_NAME})
   target_link_libraries(${app} PRIVATE LVKVulkanApp)
 endmacro()
+
+ADD_DEMO("GAME_TerrainRunner")
+ADD_DEMO("GAME_DungeonCrawler")
