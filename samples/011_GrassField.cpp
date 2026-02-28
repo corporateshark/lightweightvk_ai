@@ -29,6 +29,8 @@ layout(push_constant) uniform constants {
   float windSpeed;
   float gustStrength;
   float gustFreq;
+  float windDirX;
+  float windDirY;
   uint texOut;
   uint texSize;
 } pc;
@@ -70,27 +72,33 @@ void main() {
 
   vec2 uv = vec2(pos) / float(pc.texSize);
 
-  // slow-scrolling layered wind: primary direction + secondary cross-flow
-  float t = pc.time * pc.windSpeed * 0.15;
-  vec2 windUV = uv * pc.windFreq + vec2(t, t * 0.6);
+  // wind direction vector
+  vec2 windDir = vec2(pc.windDirX, pc.windDirY);
+  vec2 windPerp = vec2(-windDir.y, windDir.x); // perpendicular for cross-flow
+
+  // scroll noise along wind direction
+  float scrollT = pc.time * pc.windSpeed * 0.15;
+  vec2 windUV = uv * pc.windFreq + windDir * scrollT + windPerp * scrollT * 0.3;
 
   // domain warp: distort sampling coords with high-freq noise scaled by wind strength
   // produces turbulent eddies at strong wind (Ghost of Tsushima technique)
   float warpScale = 0.4 * pc.windStrength;
-  vec2 warpUV = uv * pc.windFreq * 3.0 + vec2(pc.time * 0.2, pc.time * 0.15);
+  vec2 warpUV = uv * pc.windFreq * 3.0 + windDir * pc.time * 0.2;
   vec2 warp = vec2(gradientNoise(warpUV), gradientNoise(warpUV + vec2(7.3, 2.9)));
   windUV += warp * warpScale;
 
-  float windX = fbm(windUV);
-  float windZ = fbm(windUV + vec2(5.2, 1.3));
+  float noiseX = fbm(windUV);
+  float noiseZ = fbm(windUV + vec2(5.2, 1.3));
 
   // broad rolling gusts (low frequency, slow movement)
-  vec2 gustUV = uv * pc.gustFreq + vec2(pc.time * 0.07, pc.time * 0.09);
+  vec2 gustUV = uv * pc.gustFreq + windDir * pc.time * 0.07;
   float gust = fbm(gustUV + vec2(17.0, 31.0));
   gust = smoothstep(-0.3, 0.6, gust); // soft gust envelope
 
-  // base directional wind + gust overlay
-  vec2 wind = vec2(windX, windZ) * pc.windStrength + vec2(gust, gust * 0.5) * pc.gustStrength;
+  // directional base wind + noise variation + gusts along wind direction
+  vec2 wind = windDir * pc.windStrength * 0.5
+            + vec2(noiseX, noiseZ) * pc.windStrength
+            + windDir * gust * pc.gustStrength;
 
   imageStore(kTextures2DInOut[pc.texOut], pos, vec4(wind, 0.0, 1.0));
 }
@@ -327,6 +335,8 @@ struct WindParams {
   float windSpeed;
   float gustStrength;
   float gustFreq;
+  float windDirX;
+  float windDirY;
   uint32_t texOut;
   uint32_t texSize;
 };
@@ -443,6 +453,7 @@ VULKAN_APP_MAIN {
   float windSpeed = 1.5f;
   float gustStrength = 0.3f;
   float gustFrequency = 0.5f;
+  float windAngle = 45.0f; // degrees
 
   app.run([&](uint32_t width, uint32_t height, float aspectRatio, float deltaSeconds) {
     LVK_PROFILER_FUNCTION();
@@ -465,6 +476,7 @@ VULKAN_APP_MAIN {
 
     // 1. Compute pass: generate wind texture
     {
+      const float windRad = glm::radians(windAngle);
       const WindParams windParams = {
           .time = currentTime,
           .windStrength = windStrength,
@@ -472,6 +484,8 @@ VULKAN_APP_MAIN {
           .windSpeed = windSpeed,
           .gustStrength = gustStrength,
           .gustFreq = gustFrequency,
+          .windDirX = cosf(windRad),
+          .windDirY = sinf(windRad),
           .texOut = windTexture.index(),
           .texSize = kWindTexSize,
       };
@@ -529,6 +543,7 @@ VULKAN_APP_MAIN {
       ImGui::SetNextWindowCollapsed(true, ImGuiCond_Once);
       ImGui::Begin("Wind Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
       ImGui::SliderFloat("Wind Strength", &windStrength, 0.0f, 2.0f);
+      ImGui::SliderFloat("Wind Direction", &windAngle, 0.0f, 360.0f, "%.0f deg");
       ImGui::SliderFloat("Wind Frequency", &windFrequency, 0.5f, 5.0f);
       ImGui::SliderFloat("Wind Speed", &windSpeed, 0.5f, 5.0f);
       ImGui::SliderFloat("Gust Strength", &gustStrength, 0.0f, 1.0f);
