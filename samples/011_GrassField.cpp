@@ -149,7 +149,11 @@ layout(std430, buffer_reference) readonly buffer PerFrame {
   float lightDirX;
   float lightDirY;
   float lightDirZ;
+  uint texSSAO;
+  uint sampSSAO;
   float padding2;
+  float padding3;
+  float padding4;
 };
 
 layout(push_constant) uniform constants {
@@ -202,7 +206,11 @@ layout(std430, buffer_reference) readonly buffer PerFrame {
   float lightDirX;
   float lightDirY;
   float lightDirZ;
+  uint texSSAO;
+  uint sampSSAO;
   float padding2;
+  float padding3;
+  float padding4;
 };
 
 layout(push_constant) uniform constants {
@@ -252,7 +260,11 @@ void main() {
 
   float shd = shadow(v_ShadowCoords);
 
-  vec3 color = albedo * (ambient + diffuse * shd) + sunColor * spec * shd;
+  // SSAO
+  vec2 ssaoUV = gl_FragCoord.xy / vec2(textureBindlessSize2D(pc.perFrame.texSSAO));
+  float ao = textureBindless2D(pc.perFrame.texSSAO, pc.perFrame.sampSSAO, ssaoUV).r;
+
+  vec3 color = albedo * (ambient * ao + diffuse * shd) + sunColor * spec * shd;
   out_FragColor = vec4(color, 1.0);
 }
 )";
@@ -295,7 +307,11 @@ layout(std430, buffer_reference) readonly buffer PerFrame {
   float lightDirX;
   float lightDirY;
   float lightDirZ;
+  uint texSSAO;
+  uint sampSSAO;
   float padding2;
+  float padding3;
+  float padding4;
 };
 
 layout(std430, buffer_reference) readonly buffer BladeData {
@@ -436,7 +452,7 @@ void main() {
     tipColor  = mix(vec3(0.55, 0.50, 0.18), vec3(0.70, 0.60, 0.25), f);
   }
   v_Color = mix(baseColor, tipColor, t);
-  v_AO = mix(0.4, 1.0, t); // ambient occlusion: darker at base
+  v_AO = mix(0.6, 1.0, t); // ambient occlusion: darker at base
   v_BendAmount = length(windDisplacement) * bendFactor;
   // normal faces camera in XZ, with vertical and wind tilt
   vec3 faceNormal = vec3(-camRightXZ.y, 0.0, camRightXZ.x); // perpendicular to camRight in XZ
@@ -473,7 +489,11 @@ layout(std430, buffer_reference) readonly buffer PerFrame {
   float lightDirX;
   float lightDirY;
   float lightDirZ;
+  uint texSSAO;
+  uint sampSSAO;
   float padding2;
+  float padding3;
+  float padding4;
 };
 
 layout(push_constant) uniform constants {
@@ -529,7 +549,11 @@ void main() {
 
   float shd = shadow(v_ShadowCoords);
 
-  vec3 color = v_Color * (ambient + diffuse * shd) * v_AO * windAO
+  // SSAO
+  vec2 ssaoUV = gl_FragCoord.xy / vec2(textureBindlessSize2D(pc.perFrame.texSSAO));
+  float ao = textureBindless2D(pc.perFrame.texSSAO, pc.perFrame.sampSSAO, ssaoUV).r;
+
+  vec3 color = v_Color * (ambient * ao + diffuse * shd) * v_AO * windAO
              + transColor * shd
              + sunColor * spec * shd;
   out_FragColor = vec4(color, 1.0);
@@ -553,7 +577,11 @@ layout(std430, buffer_reference) readonly buffer PerFrame {
   float lightDirX;
   float lightDirY;
   float lightDirZ;
+  uint texSSAO;
+  uint sampSSAO;
   float padding2;
+  float padding3;
+  float padding4;
 };
 
 layout(push_constant) uniform constants {
@@ -609,7 +637,11 @@ layout(std430, buffer_reference) readonly buffer PerFrame {
   float lightDirX;
   float lightDirY;
   float lightDirZ;
+  uint texSSAO;
+  uint sampSSAO;
   float padding2;
+  float padding3;
+  float padding4;
 };
 
 layout(std430, buffer_reference) readonly buffer BladeData {
@@ -694,6 +726,169 @@ const char* codeShadowFS = R"(
 void main() {}
 )";
 
+// SSAO compute shader: hemisphere sampling from depth buffer
+const char* codeSSAOCompute = R"(
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout (set = 0, binding = 0) uniform texture2D kTextures2D[];
+layout (set = 0, binding = 1) uniform sampler   kSamplers[];
+layout (set = 0, binding = 2, rgba16f) uniform image2D kTextures2DInOut[];
+
+layout(push_constant) uniform constants {
+  uint texDepth;
+  uint sampDepth;
+  uint texOut;
+  uint width;
+  uint height;
+  float proj00;
+  float proj11;
+  float proj22;
+  float proj32;
+  float radius;
+  float bias;
+  float intensity;
+} pc;
+
+vec3 viewPosFromDepth(vec2 uv, float d) {
+  float z_ndc = 2.0 * d - 1.0;
+  float z_eye = -pc.proj32 / (z_ndc + pc.proj22);
+  float negZ = -z_eye;
+  return vec3(
+    (2.0 * uv.x - 1.0) * negZ / pc.proj00,
+    -(2.0 * uv.y - 1.0) * negZ / pc.proj11,
+    z_eye
+  );
+}
+
+float hash(vec2 p) {
+  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+// 16 hemisphere samples biased toward the surface (cosine-weighted)
+const int KERNEL_SIZE = 16;
+const vec3 kernel[KERNEL_SIZE] = vec3[](
+  vec3( 0.04, 0.04, 0.06),
+  vec3(-0.08, 0.10, 0.12),
+  vec3( 0.12,-0.04, 0.10),
+  vec3(-0.05,-0.12, 0.18),
+  vec3( 0.16, 0.08, 0.08),
+  vec3(-0.12, 0.18, 0.14),
+  vec3( 0.08,-0.16, 0.12),
+  vec3( 0.22, 0.00, 0.10),
+  vec3(-0.18,-0.08, 0.22),
+  vec3( 0.00, 0.22, 0.18),
+  vec3( 0.26,-0.12, 0.08),
+  vec3(-0.08, 0.26, 0.14),
+  vec3( 0.14, 0.14, 0.28),
+  vec3(-0.26, 0.04, 0.18),
+  vec3( 0.04,-0.28, 0.22),
+  vec3( 0.18, 0.18, 0.20)
+);
+
+void main() {
+  ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+  if (pos.x >= int(pc.width) || pos.y >= int(pc.height)) return;
+
+  vec2 texelSize = 1.0 / vec2(pc.width, pc.height);
+  vec2 uv = (vec2(pos) + 0.5) * texelSize;
+
+  float depth = texture(
+    nonuniformEXT(sampler2D(kTextures2D[pc.texDepth], kSamplers[pc.sampDepth])), uv).r;
+  if (depth >= 1.0) {
+    imageStore(kTextures2DInOut[pc.texOut], pos, vec4(1.0));
+    return;
+  }
+
+  vec3 P = viewPosFromDepth(uv, depth);
+
+  // reconstruct normal from depth neighbors
+  float dR = texture(
+    nonuniformEXT(sampler2D(kTextures2D[pc.texDepth], kSamplers[pc.sampDepth])),
+    uv + vec2(texelSize.x, 0)).r;
+  float dU = texture(
+    nonuniformEXT(sampler2D(kTextures2D[pc.texDepth], kSamplers[pc.sampDepth])),
+    uv + vec2(0, texelSize.y)).r;
+  vec3 PR = viewPosFromDepth(uv + vec2(texelSize.x, 0), dR);
+  vec3 PU = viewPosFromDepth(uv + vec2(0, texelSize.y), dU);
+  vec3 N = normalize(cross(PR - P, PU - P));
+  if (dot(N, P) > 0.0) N = -N;
+
+  // per-pixel random rotation
+  float angle = hash(vec2(pos)) * 6.2831853;
+  float cosA = cos(angle), sinA = sin(angle);
+
+  // build TBN from normal
+  vec3 T = abs(N.z) < 0.99 ? normalize(cross(N, vec3(0, 0, 1))) : normalize(cross(N, vec3(1, 0, 0)));
+  vec3 B = cross(N, T);
+  mat3 TBN = mat3(T, B, N);
+
+  float occlusion = 0.0;
+  for (int i = 0; i < KERNEL_SIZE; i++) {
+    // rotate sample in tangent plane
+    vec3 k = kernel[i];
+    vec2 rotated = vec2(k.x * cosA - k.y * sinA, k.x * sinA + k.y * cosA);
+    vec3 sampleDir = TBN * vec3(rotated, k.z);
+
+    vec3 samplePos = P + sampleDir * pc.radius;
+
+    // project to screen
+    float clipX = samplePos.x * pc.proj00;
+    float clipY = samplePos.y * pc.proj11;
+    float clipZ = samplePos.z * pc.proj22 + pc.proj32;
+    float clipW = -samplePos.z;
+
+    vec2 sampleUV = vec2(clipX / clipW * 0.5 + 0.5, 0.5 - clipY / clipW * 0.5);
+    sampleUV = clamp(sampleUV, vec2(0.001), vec2(0.999));
+
+    float sampleDepth = texture(
+      nonuniformEXT(sampler2D(kTextures2D[pc.texDepth], kSamplers[pc.sampDepth])),
+      sampleUV).r;
+    float sampleZ = viewPosFromDepth(sampleUV, sampleDepth).z;
+
+    float rangeCheck = smoothstep(0.0, 1.0, pc.radius / abs(P.z - sampleZ));
+    occlusion += (sampleZ >= samplePos.z + pc.bias ? 1.0 : 0.0) * rangeCheck;
+  }
+
+  float ao = 1.0 - (occlusion / float(KERNEL_SIZE)) * pc.intensity;
+  ao = clamp(ao, 0.0, 1.0);
+  imageStore(kTextures2DInOut[pc.texOut], pos, vec4(ao, ao, ao, 1.0));
+}
+)";
+
+// SSAO blur compute shader: 5x5 box blur
+const char* codeSSAOBlurCompute = R"(
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout (set = 0, binding = 0) uniform texture2D kTextures2D[];
+layout (set = 0, binding = 1) uniform sampler   kSamplers[];
+layout (set = 0, binding = 2, rgba16f) uniform image2D kTextures2DInOut[];
+
+layout(push_constant) uniform constants {
+  uint texIn;
+  uint sampIn;
+  uint texOut;
+  uint width;
+  uint height;
+} pc;
+
+void main() {
+  ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+  if (pos.x >= int(pc.width) || pos.y >= int(pc.height)) return;
+
+  vec2 texelSize = 1.0 / vec2(pc.width, pc.height);
+  float sum = 0.0;
+  for (int y = -2; y <= 2; y++) {
+    for (int x = -2; x <= 2; x++) {
+      vec2 uv = (vec2(pos) + vec2(x, y) + 0.5) * texelSize;
+      uv = clamp(uv, vec2(0.0), vec2(1.0));
+      sum += texture(
+        nonuniformEXT(sampler2D(kTextures2D[pc.texIn], kSamplers[pc.sampIn])), uv).r;
+    }
+  }
+  imageStore(kTextures2DInOut[pc.texOut], pos, vec4(sum / 25.0, 0, 0, 1));
+}
+)";
+
 // clang-format on
 
 struct GrassBlade {
@@ -721,7 +916,11 @@ struct PerFrame {
   float lightDirX;
   float lightDirY;
   float lightDirZ;
+  uint32_t texSSAO;
+  uint32_t sampSSAO;
   float padding2;
+  float padding3;
+  float padding4;
 };
 
 struct WindParams {
@@ -858,6 +1057,25 @@ VULKAN_APP_MAIN {
       .debugName = "Buffer: per frame (shadow)",
   });
 
+  // SSAO resources: clamp sampler for depth texture reading
+  lvk::Holder<lvk::SamplerHandle> ssaoSampler = ctx->createSampler({
+      .wrapU = lvk::SamplerWrap_Clamp,
+      .wrapV = lvk::SamplerWrap_Clamp,
+      .debugName = "Sampler: SSAO clamp",
+  });
+
+  // 1x1 white texture used as SSAO fallback when disabled
+  const uint16_t whitePixel[] = {0x3C00, 0x3C00, 0x3C00, 0x3C00}; // fp16 1.0
+  lvk::Holder<lvk::TextureHandle> whiteTex = ctx->createTexture({
+      .type = lvk::TextureType_2D,
+      .format = lvk::Format_RGBA_F16,
+      .dimensions = {1, 1},
+      .usage = lvk::TextureUsageBits_Sampled,
+      .numMipLevels = 1,
+      .data = whitePixel,
+      .debugName = "Texture: white 1x1",
+  });
+
   // Inject terrain function into shaders that use %TERRAIN_FUNC% placeholder
   auto injectTerrain = [](const char* src) -> std::string {
     std::string s(src);
@@ -889,6 +1107,10 @@ VULKAN_APP_MAIN {
       ctx->createShaderModule({shadowGrassVS.c_str(), lvk::Stage_Vert, "Shader Module: shadow grass (vert)"});
   lvk::Holder<lvk::ShaderModuleHandle> smShadowFrag =
       ctx->createShaderModule({codeShadowFS, lvk::Stage_Frag, "Shader Module: shadow (frag)"});
+  lvk::Holder<lvk::ShaderModuleHandle> smSSAOComp =
+      ctx->createShaderModule({codeSSAOCompute, lvk::Stage_Comp, "Shader Module: SSAO compute"});
+  lvk::Holder<lvk::ShaderModuleHandle> smSSAOBlurComp =
+      ctx->createShaderModule({codeSSAOBlurCompute, lvk::Stage_Comp, "Shader Module: SSAO blur compute"});
 
   // Pipelines
   lvk::Holder<lvk::ComputePipelineHandle> pipelineWind = ctx->createComputePipeline({
@@ -936,6 +1158,36 @@ VULKAN_APP_MAIN {
       .debugName = "Pipeline: shadow grass",
   });
 
+  // Depth prepass pipelines (1x, for SSAO depth input — reuse shadow shader modules)
+  lvk::Holder<lvk::RenderPipelineHandle> pipelineDepthGround = ctx->createRenderPipeline({
+      .topology = lvk::Topology_TriangleStrip,
+      .smVert = smShadowGroundVert,
+      .smFrag = smShadowFrag,
+      .depthFormat = lvk::Format_Z_F32,
+      .cullMode = lvk::CullMode_None,
+      .debugName = "Pipeline: depth prepass ground",
+  });
+
+  lvk::Holder<lvk::RenderPipelineHandle> pipelineDepthGrass = ctx->createRenderPipeline({
+      .topology = lvk::Topology_TriangleStrip,
+      .smVert = smShadowGrassVert,
+      .smFrag = smShadowFrag,
+      .depthFormat = lvk::Format_Z_F32,
+      .cullMode = lvk::CullMode_None,
+      .debugName = "Pipeline: depth prepass grass",
+  });
+
+  // SSAO compute pipelines
+  lvk::Holder<lvk::ComputePipelineHandle> pipelineSSAO = ctx->createComputePipeline({
+      .smComp = smSSAOComp,
+      .debugName = "Pipeline: SSAO",
+  });
+
+  lvk::Holder<lvk::ComputePipelineHandle> pipelineSSAOBlur = ctx->createComputePipeline({
+      .smComp = smSSAOBlurComp,
+      .debugName = "Pipeline: SSAO blur",
+  });
+
   // Light/shadow constants
   const mat4 scaleBias = mat4(0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 1, 0, 0.5, 0.5, 0, 1);
 
@@ -950,10 +1202,18 @@ VULKAN_APP_MAIN {
   float sunElevation = 63.0f; // degrees from horizontal
   float sunAzimuth = 53.0f;   // degrees around Y axis
   bool showShadowMap = false;
+  float ssaoRadius = 0.5f;
+  float ssaoBias = 0.025f;
+  float ssaoIntensity = 1.2f;
+  bool ssaoEnabled = true;
 
   // MSAA textures (recreated on resize)
   lvk::Holder<lvk::TextureHandle> msaaColor;
   lvk::Holder<lvk::TextureHandle> msaaDepth;
+  // SSAO textures (recreated on resize)
+  lvk::Holder<lvk::TextureHandle> ssaoDepthPrepass;
+  lvk::Holder<lvk::TextureHandle> ssaoRaw;
+  lvk::Holder<lvk::TextureHandle> ssaoBlurred;
   uint32_t msaaWidth = 0, msaaHeight = 0;
 
   app.run([&](uint32_t width, uint32_t height, float aspectRatio, float deltaSeconds) {
@@ -980,6 +1240,29 @@ VULKAN_APP_MAIN {
           .usage = lvk::TextureUsageBits_Attachment,
           .numMipLevels = 1,
           .debugName = "Texture: MSAA depth",
+      });
+      // SSAO textures (1x resolution)
+      ssaoDepthPrepass = ctx->createTexture({
+          .type = lvk::TextureType_2D,
+          .format = lvk::Format_Z_F32,
+          .dimensions = {width, height},
+          .usage = lvk::TextureUsageBits_Attachment | lvk::TextureUsageBits_Sampled,
+          .numMipLevels = 1,
+          .debugName = "Texture: SSAO depth prepass",
+      });
+      ssaoRaw = ctx->createTexture({
+          .type = lvk::TextureType_2D,
+          .format = lvk::Format_RGBA_F16,
+          .dimensions = {width, height},
+          .usage = lvk::TextureUsageBits_Storage | lvk::TextureUsageBits_Sampled,
+          .debugName = "Texture: SSAO raw",
+      });
+      ssaoBlurred = ctx->createTexture({
+          .type = lvk::TextureType_2D,
+          .format = lvk::Format_RGBA_F16,
+          .dimensions = {width, height},
+          .usage = lvk::TextureUsageBits_Storage | lvk::TextureUsageBits_Sampled,
+          .debugName = "Texture: SSAO blurred",
       });
     }
 
@@ -1015,8 +1298,10 @@ VULKAN_APP_MAIN {
     lightProj[2][2] = -1.0f / (farPlane - nearPlane);
     lightProj[3][2] = -nearPlane / (farPlane - nearPlane);
 
+    const mat4 projMatrix = glm::perspective(fov, aspectRatio, 0.1f, 200.0f);
+
     const PerFrame perFrame = {
-        .proj = glm::perspective(fov, aspectRatio, 0.1f, 200.0f),
+        .proj = projMatrix,
         .view = app.camera_.getViewMatrix(),
         .light = scaleBias * lightProj * lightView,
         .time = currentTime,
@@ -1030,6 +1315,8 @@ VULKAN_APP_MAIN {
         .lightDirX = lightDir.x,
         .lightDirY = lightDir.y,
         .lightDirZ = lightDir.z,
+        .texSSAO = ssaoEnabled ? ssaoBlurred.index() : whiteTex.index(),
+        .sampSSAO = ssaoSampler.index(),
     };
 
     const PerFrame perFrameShadow = {
@@ -1115,7 +1402,108 @@ VULKAN_APP_MAIN {
       buffer.transitionToShaderReadOnly(shadowMap);
     }
 
-    // 3. Main render pass (4x MSAA → resolve to swapchain)
+    // 3. Depth prepass (1x, camera perspective — for SSAO)
+    if (ssaoEnabled) {
+      lvk::Framebuffer depthFB = {
+          .depthStencil = {ssaoDepthPrepass},
+      };
+      buffer.cmdBeginRendering(
+          lvk::RenderPass{
+              .color = {},
+              .depth = {.loadOp = lvk::LoadOp_Clear, .storeOp = lvk::StoreOp_Store, .clearDepth = 1.0f}},
+          depthFB,
+          {.textures = {lvk::TextureHandle(windTexture)}});
+      {
+        buffer.cmdBindViewport({0.0f, 0.0f, (float)width, (float)height, 0.0f, +1.0f});
+        buffer.cmdBindScissorRect({0, 0, width, height});
+        buffer.cmdBindDepthState({.compareOp = lvk::CompareOp_Less, .isDepthWriteEnabled = true});
+
+        // Depth ground (reuses shadow shaders with camera matrices)
+        {
+          buffer.cmdBindRenderPipeline(pipelineDepthGround);
+          const struct {
+            uint64_t perFrame;
+          } depthGroundPC = {
+              .perFrame = ctx->gpuAddress(bufPerFrame),
+          };
+          buffer.cmdPushConstants(depthGroundPC);
+          buffer.cmdDraw(2 * (kGridSize + 1), kGridSize);
+        }
+
+        // Depth grass
+        {
+          buffer.cmdBindRenderPipeline(pipelineDepthGrass);
+          const struct {
+            uint64_t perFrame;
+            uint64_t bladeData;
+          } depthGrassPC = {
+              .perFrame = ctx->gpuAddress(bufPerFrame),
+              .bladeData = ctx->gpuAddress(bufBlades),
+          };
+          buffer.cmdPushConstants(depthGrassPC);
+          buffer.cmdDraw(kBladesPerStrip, kNumBlades);
+        }
+      }
+      buffer.cmdEndRendering();
+      buffer.transitionToShaderReadOnly(ssaoDepthPrepass);
+
+      // 4. SSAO compute
+      {
+        const struct {
+          uint32_t texDepth;
+          uint32_t sampDepth;
+          uint32_t texOut;
+          uint32_t width;
+          uint32_t height;
+          float proj00;
+          float proj11;
+          float proj22;
+          float proj32;
+          float radius;
+          float bias;
+          float intensity;
+        } ssaoPC = {
+            .texDepth = ssaoDepthPrepass.index(),
+            .sampDepth = ssaoSampler.index(),
+            .texOut = ssaoRaw.index(),
+            .width = width,
+            .height = height,
+            .proj00 = projMatrix[0][0],
+            .proj11 = projMatrix[1][1],
+            .proj22 = projMatrix[2][2],
+            .proj32 = projMatrix[3][2],
+            .radius = ssaoRadius,
+            .bias = ssaoBias,
+            .intensity = ssaoIntensity,
+        };
+        buffer.cmdBindComputePipeline(pipelineSSAO);
+        buffer.cmdPushConstants(ssaoPC);
+        buffer.cmdDispatchThreadGroups({(width + 15) / 16, (height + 15) / 16, 1});
+      }
+
+      // 5. SSAO blur (reads ssaoRaw as sampled texture, writes ssaoBlurred as storage)
+      buffer.transitionToShaderReadOnly(ssaoRaw);
+      {
+        const struct {
+          uint32_t texIn;
+          uint32_t sampIn;
+          uint32_t texOut;
+          uint32_t width;
+          uint32_t height;
+        } blurPC = {
+            .texIn = ssaoRaw.index(),
+            .sampIn = ssaoSampler.index(),
+            .texOut = ssaoBlurred.index(),
+            .width = width,
+            .height = height,
+        };
+        buffer.cmdBindComputePipeline(pipelineSSAOBlur);
+        buffer.cmdPushConstants(blurPC);
+        buffer.cmdDispatchThreadGroups({(width + 15) / 16, (height + 15) / 16, 1});
+      }
+    }
+
+    // Main render pass (4x MSAA → resolve to swapchain)
     {
       lvk::Framebuffer framebuffer = {
           .color = {{.texture = msaaColor, .resolveTexture = ctx->getCurrentSwapchainTexture()}},
@@ -1126,7 +1514,7 @@ VULKAN_APP_MAIN {
               .color = {{.loadOp = lvk::LoadOp_Clear, .storeOp = lvk::StoreOp_MsaaResolve, .clearColor = {0.53f, 0.81f, 0.92f, 1.0f}}},
               .depth = {.loadOp = lvk::LoadOp_Clear, .clearDepth = 1.0}},
           framebuffer,
-          {.textures = {lvk::TextureHandle(windTexture)}});
+          {.textures = {lvk::TextureHandle(windTexture), ssaoEnabled ? lvk::TextureHandle(ssaoBlurred) : lvk::TextureHandle(whiteTex)}});
       {
         buffer.cmdBindViewport({0.0f, 0.0f, (float)width, (float)height, 0.0f, +1.0f});
         buffer.cmdBindScissorRect({0, 0, width, height});
@@ -1161,7 +1549,7 @@ VULKAN_APP_MAIN {
       buffer.cmdEndRendering();
     }
 
-    // 4. ImGui pass (1x, draws over resolved swapchain)
+    // ImGui pass (1x, draws over resolved swapchain)
     {
       lvk::Framebuffer framebuffer = {
           .color = {{.texture = ctx->getCurrentSwapchainTexture()}},
@@ -1190,6 +1578,14 @@ VULKAN_APP_MAIN {
         ImGui::Checkbox("Show Shadow Map", &showShadowMap);
         if (showShadowMap) {
           ImGui::Image(shadowMap.index(), ImVec2(256, 256));
+        }
+        ImGui::Separator();
+        ImGui::Text("SSAO");
+        ImGui::Checkbox("Enable SSAO", &ssaoEnabled);
+        if (ssaoEnabled) {
+          ImGui::SliderFloat("SSAO Radius", &ssaoRadius, 0.1f, 2.0f);
+          ImGui::SliderFloat("SSAO Bias", &ssaoBias, 0.001f, 0.1f, "%.3f");
+          ImGui::SliderFloat("SSAO Intensity", &ssaoIntensity, 0.5f, 3.0f);
         }
         ImGui::End();
         app.drawFPS();
