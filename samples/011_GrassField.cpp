@@ -136,6 +136,7 @@ layout (set = 0, binding = 1) uniform sampler   kSamplers[];
 layout (location=0) out vec3 v_Color;
 layout (location=1) out float v_AO;
 layout (location=2) out vec3 v_Normal;
+layout (location=3) out float v_BendAmount;
 
 struct GrassBlade {
   float posX, posZ;
@@ -242,6 +243,7 @@ void main() {
   vec3 tipColor  = mix(vec3(0.30, 0.60, 0.10), vec3(0.50, 0.75, 0.20), blade.colorVariation);
   v_Color = mix(baseColor, tipColor, t);
   v_AO = mix(0.4, 1.0, t); // ambient occlusion: darker at base
+  v_BendAmount = length(windDisplacement) * bendFactor;
   // normal faces camera in XZ, with vertical and wind tilt
   vec3 faceNormal = vec3(-camRightXZ.y, 0.0, camRightXZ.x); // perpendicular to camRight in XZ
   v_Normal = normalize(faceNormal * widthScale * 0.3 + vec3(windDisplacement.x * 0.2, 1.0, windDisplacement.y * 0.2));
@@ -255,6 +257,7 @@ const char* codeGrassFS = R"(
 layout (location=0) in vec3 v_Color;
 layout (location=1) in float v_AO;
 layout (location=2) in vec3 v_Normal;
+layout (location=3) in float v_BendAmount;
 layout (location=0) out vec4 out_FragColor;
 
 void main() {
@@ -263,7 +266,10 @@ void main() {
   float NdotL = max(dot(normalize(v_Normal), lightDir), 0.0);
   float lighting = 0.3 + 0.7 * NdotL; // ambient + diffuse
 
-  vec3 color = v_Color * lighting * v_AO;
+  // wind-driven AO: bent blades darken (self-shadowing)
+  float windAO = 1.0 - clamp(v_BendAmount * 0.6, 0.0, 0.35);
+
+  vec3 color = v_Color * lighting * v_AO * windAO;
   out_FragColor = vec4(color, 1.0);
 }
 )";
