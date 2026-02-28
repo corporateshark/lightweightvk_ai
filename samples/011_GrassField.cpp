@@ -8,11 +8,14 @@
 #include "VulkanApp.h"
 
 #include <random>
+#include <string>
 
-constexpr uint32_t kNumBlades = 200000;
+constexpr uint32_t kNumBlades = 1000000;
 constexpr float kFieldSize = 20.0f;
 constexpr uint32_t kWindTexSize = 256;
 constexpr uint32_t kBladesPerStrip = 7;
+constexpr uint32_t kGridSize = 128; // terrain grid: kGridSize x kGridSize quads
+constexpr uint32_t kMSAASamples = 4;
 
 // clang-format off
 
@@ -104,42 +107,134 @@ void main() {
 }
 )";
 
-// Ground plane vertex shader: 4-vertex triangle strip quad at Y=0
+// Terrain height function (GLSL snippet, included in both ground and grass shaders)
+// Layered sine waves creating gentle rolling hills and mounds
+const char* codeTerrainFunc = R"(
+float terrainHeight(vec2 p) {
+  return 0.45 * sin(p.x * 0.25) * sin(p.y * 0.20)
+       + 0.25 * sin(p.x * 0.55 + 1.3) * sin(p.y * 0.45 + 2.1)
+       + 0.12 * sin(p.x * 1.1 + 3.7) * cos(p.y * 0.9 + 0.8)
+       + 0.06 * cos(p.x * 2.3 + 0.5) * sin(p.y * 1.8 + 1.5);
+}
+
+vec3 terrainNormal(vec2 p) {
+  float eps = 0.1;
+  float hC = terrainHeight(p);
+  float hR = terrainHeight(p + vec2(eps, 0.0));
+  float hU = terrainHeight(p + vec2(0.0, eps));
+  return normalize(vec3(hC - hR, eps, hC - hU));
+}
+)";
+
+// Ground vertex shader: tessellated grid with terrain height
+// Each instance = one row of triangle strip connecting row i to row i+1
 const char* codeGroundVS = R"(
 layout (location=0) out vec2 v_WorldXZ;
+layout (location=1) out vec3 v_Normal;
+layout (location=2) out vec4 v_ShadowCoords;
 
 layout(std430, buffer_reference) readonly buffer PerFrame {
   mat4 proj;
   mat4 view;
+  mat4 light;
   float time;
   uint windTex;
   uint windSamp;
   float fieldSize;
+  uint gridSize;
+  uint texShadow;
+  uint sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  float padding2;
 };
 
 layout(push_constant) uniform constants {
   PerFrame perFrame;
 } pc;
 
+%TERRAIN_FUNC%
+
 void main() {
+  uint N = pc.perFrame.gridSize;
   float s = pc.perFrame.fieldSize;
-  // triangle strip: 0=(-s,0,-s), 1=(s,0,-s), 2=(-s,0,s), 3=(s,0,s)
-  vec2 pos = vec2((gl_VertexIndex & 1) * 2.0 - 1.0, (gl_VertexIndex >> 1) * 2.0 - 1.0) * s;
-  v_WorldXZ = pos;
-  gl_Position = pc.perFrame.proj * pc.perFrame.view * vec4(pos.x, 0.0, pos.y, 1.0);
+
+  // gl_InstanceIndex = row index, gl_VertexIndex encodes column + top/bottom
+  uint col = gl_VertexIndex / 2;
+  uint isTop = gl_VertexIndex % 2;
+  uint row = gl_InstanceIndex + isTop;
+
+  vec2 xz = vec2(float(col) / float(N), float(row) / float(N)) * 2.0 - 1.0;
+  xz *= s;
+
+  float y = terrainHeight(xz);
+  v_WorldXZ = xz;
+  v_Normal = terrainNormal(xz);
+  v_ShadowCoords = pc.perFrame.light * vec4(xz.x, y, xz.y, 1.0);
+  gl_Position = pc.perFrame.proj * pc.perFrame.view * vec4(xz.x, y, xz.y, 1.0);
 }
 )";
 
-// Ground plane fragment shader
+// Ground fragment shader with terrain-aware lighting and shadows
 const char* codeGroundFS = R"(
 layout (location=0) in vec2 v_WorldXZ;
+layout (location=1) in vec3 v_Normal;
+layout (location=2) in vec4 v_ShadowCoords;
 layout (location=0) out vec4 out_FragColor;
+
+layout(std430, buffer_reference) readonly buffer PerFrame {
+  mat4 proj;
+  mat4 view;
+  mat4 light;
+  float time;
+  uint windTex;
+  uint windSamp;
+  float fieldSize;
+  uint gridSize;
+  uint texShadow;
+  uint sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  float padding2;
+};
+
+layout(push_constant) uniform constants {
+  PerFrame perFrame;
+} pc;
+
+float PCF3(vec3 uvw) {
+  float size = 1.0 / textureBindlessSize2D(pc.perFrame.texShadow).x;
+  float shadow = 0.0;
+  for (int v=-1; v<=+1; v++)
+    for (int u=-1; u<=+1; u++)
+      shadow += textureBindless2DShadow(pc.perFrame.texShadow, pc.perFrame.sampShadow, uvw + size * vec3(u, v, 0));
+  return shadow / 9;
+}
+
+float shadow(vec4 s) {
+  s = s / s.w;
+  if (s.z > -1.0 && s.z < 1.0) {
+    float shadowSample = PCF3(vec3(s.x, 1.0 - s.y, s.z + pc.perFrame.depthBias));
+    return mix(0.3, 1.0, shadowSample);
+  }
+  return 1.0;
+}
 
 void main() {
   // earthy brown with subtle variation
   float n = fract(sin(dot(floor(v_WorldXZ * 4.0), vec2(12.9898, 78.233))) * 43758.5453);
   vec3 brown = mix(vec3(0.28, 0.20, 0.10), vec3(0.35, 0.25, 0.12), n);
-  out_FragColor = vec4(brown, 1.0);
+
+  // directional light on terrain
+  vec3 lightDir = normalize(vec3(pc.perFrame.lightDirX, pc.perFrame.lightDirY, pc.perFrame.lightDirZ));
+  float NdotL = max(dot(normalize(v_Normal), lightDir), 0.0);
+  float lighting = 0.35 + 0.65 * NdotL;
+
+  out_FragColor = vec4(brown * lighting * shadow(v_ShadowCoords), 1.0);
 }
 )";
 
@@ -153,6 +248,7 @@ layout (location=0) out vec3 v_Color;
 layout (location=1) out float v_AO;
 layout (location=2) out vec3 v_Normal;
 layout (location=3) out float v_BendAmount;
+layout (location=4) out vec4 v_ShadowCoords;
 
 struct GrassBlade {
   float posX, posZ;
@@ -160,15 +256,26 @@ struct GrassBlade {
   float lean, phase;
   float stiffness;
   float colorVariation;
+  float curvature; // natural rest bend amount
+  float padding;
 };
 
 layout(std430, buffer_reference) readonly buffer PerFrame {
   mat4 proj;
   mat4 view;
+  mat4 light;
   float time;
   uint windTex;
   uint windSamp;
   float fieldSize;
+  uint gridSize;
+  uint texShadow;
+  uint sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  float padding2;
 };
 
 layout(std430, buffer_reference) readonly buffer BladeData {
@@ -179,6 +286,8 @@ layout(push_constant) uniform constants {
   PerFrame perFrame;
   BladeData bladeData;
 } pc;
+
+%TERRAIN_FUNC%
 
 void main() {
   GrassBlade blade = pc.bladeData.blades[gl_InstanceIndex];
@@ -199,7 +308,9 @@ void main() {
     widthScale = (side == 0) ? -1.0 : 1.0;
   }
 
-  float bladeWidth = blade.width * (1.0 - t * 0.8); // taper
+  // taper varies with blade height: short blades stay wide, tall blades narrow quickly
+  float taperRate = mix(0.5, 0.9, clamp(blade.height / 0.8, 0.0, 1.0));
+  float bladeWidth = blade.width * (1.0 - t * taperRate);
 
   // sample wind texture
   vec2 fieldUV = vec2(blade.posX, blade.posZ) / (2.0 * pc.perFrame.fieldSize) + 0.5;
@@ -245,9 +356,13 @@ void main() {
   float halfW = widthScale * bladeWidth * 0.5;
 
   // --- arc-based bending ---
+  // natural rest curvature: blade droops in its lean direction even without wind
+  vec2 restBend = bladeDir * blade.curvature;
+
   // compute total horizontal bend at this vertex's height as an arc angle
-  // wind bend + lean + detail flutter all contribute to the bend direction
-  vec2 totalBendXZ = windDisplacement * bendFactor
+  // rest curvature + wind bend + lean + detail flutter all contribute
+  vec2 totalBendXZ = restBend
+                   + windDisplacement * bendFactor
                    + vec2(blade.lean * 0.3) * alignment
                    + vec2(detailLateral, detailLateral * 0.7) * detailAtten;
   float bendMag = length(totalBendXZ);
@@ -273,9 +388,33 @@ void main() {
   // detail vertical bob
   pos.y += detailVertical * detailAtten;
 
-  // color: dark green at base, bright green at tip with variation
-  vec3 baseColor = mix(vec3(0.05, 0.15, 0.02), vec3(0.10, 0.20, 0.03), blade.colorVariation);
-  vec3 tipColor  = mix(vec3(0.30, 0.60, 0.10), vec3(0.50, 0.75, 0.20), blade.colorVariation);
+  // terrain height offset
+  pos.y += terrainHeight(vec2(blade.posX, blade.posZ));
+
+  // rich meadow color palette: interpolate across multiple hues based on colorVariation
+  float cv = blade.colorVariation;
+  vec3 baseColor, tipColor;
+  if (cv < 0.3) {
+    // dark green / emerald
+    float f = cv / 0.3;
+    baseColor = mix(vec3(0.03, 0.10, 0.02), vec3(0.05, 0.14, 0.02), f);
+    tipColor  = mix(vec3(0.15, 0.40, 0.05), vec3(0.25, 0.55, 0.10), f);
+  } else if (cv < 0.6) {
+    // bright green / spring
+    float f = (cv - 0.3) / 0.3;
+    baseColor = mix(vec3(0.05, 0.14, 0.02), vec3(0.08, 0.13, 0.03), f);
+    tipColor  = mix(vec3(0.25, 0.55, 0.10), vec3(0.40, 0.65, 0.12), f);
+  } else if (cv < 0.85) {
+    // olive / warm green
+    float f = (cv - 0.6) / 0.25;
+    baseColor = mix(vec3(0.08, 0.13, 0.03), vec3(0.12, 0.11, 0.04), f);
+    tipColor  = mix(vec3(0.40, 0.65, 0.12), vec3(0.50, 0.50, 0.15), f);
+  } else {
+    // dried golden / straw
+    float f = (cv - 0.85) / 0.15;
+    baseColor = mix(vec3(0.12, 0.11, 0.04), vec3(0.18, 0.14, 0.05), f);
+    tipColor  = mix(vec3(0.55, 0.50, 0.18), vec3(0.70, 0.60, 0.25), f);
+  }
   v_Color = mix(baseColor, tipColor, t);
   v_AO = mix(0.4, 1.0, t); // ambient occlusion: darker at base
   v_BendAmount = length(windDisplacement) * bendFactor;
@@ -283,6 +422,7 @@ void main() {
   vec3 faceNormal = vec3(-camRightXZ.y, 0.0, camRightXZ.x); // perpendicular to camRight in XZ
   v_Normal = normalize(faceNormal * widthScale * 0.3 + vec3(windDisplacement.x * 0.2, 1.0, windDisplacement.y * 0.2));
 
+  v_ShadowCoords = pc.perFrame.light * vec4(pos, 1.0);
   gl_Position = pc.perFrame.proj * pc.perFrame.view * vec4(pos, 1.0);
 }
 )";
@@ -293,20 +433,219 @@ layout (location=0) in vec3 v_Color;
 layout (location=1) in float v_AO;
 layout (location=2) in vec3 v_Normal;
 layout (location=3) in float v_BendAmount;
+layout (location=4) in vec4 v_ShadowCoords;
 layout (location=0) out vec4 out_FragColor;
+
+layout(std430, buffer_reference) readonly buffer PerFrame {
+  mat4 proj;
+  mat4 view;
+  mat4 light;
+  float time;
+  uint windTex;
+  uint windSamp;
+  float fieldSize;
+  uint gridSize;
+  uint texShadow;
+  uint sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  float padding2;
+};
+
+layout(push_constant) uniform constants {
+  PerFrame perFrame;
+} pc;
+
+float PCF3(vec3 uvw) {
+  float size = 1.0 / textureBindlessSize2D(pc.perFrame.texShadow).x;
+  float shadow = 0.0;
+  for (int v=-1; v<=+1; v++)
+    for (int u=-1; u<=+1; u++)
+      shadow += textureBindless2DShadow(pc.perFrame.texShadow, pc.perFrame.sampShadow, uvw + size * vec3(u, v, 0));
+  return shadow / 9;
+}
+
+float shadow(vec4 s) {
+  s = s / s.w;
+  if (s.z > -1.0 && s.z < 1.0) {
+    float shadowSample = PCF3(vec3(s.x, 1.0 - s.y, s.z + pc.perFrame.depthBias));
+    return mix(0.3, 1.0, shadowSample);
+  }
+  return 1.0;
+}
 
 void main() {
   // simple directional light
-  vec3 lightDir = normalize(vec3(0.4, 1.0, 0.3));
+  vec3 lightDir = normalize(vec3(pc.perFrame.lightDirX, pc.perFrame.lightDirY, pc.perFrame.lightDirZ));
   float NdotL = max(dot(normalize(v_Normal), lightDir), 0.0);
   float lighting = 0.3 + 0.7 * NdotL; // ambient + diffuse
 
   // wind-driven AO: bent blades darken (self-shadowing)
   float windAO = 1.0 - clamp(v_BendAmount * 0.6, 0.0, 0.35);
 
-  vec3 color = v_Color * lighting * v_AO * windAO;
+  vec3 color = v_Color * lighting * v_AO * windAO * shadow(v_ShadowCoords);
   out_FragColor = vec4(color, 1.0);
 }
+)";
+
+// Shadow pass: depth-only ground vertex shader (light perspective)
+const char* codeShadowGroundVS = R"(
+layout(std430, buffer_reference) readonly buffer PerFrame {
+  mat4 proj;
+  mat4 view;
+  mat4 light;
+  float time;
+  uint windTex;
+  uint windSamp;
+  float fieldSize;
+  uint gridSize;
+  uint texShadow;
+  uint sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  float padding2;
+};
+
+layout(push_constant) uniform constants {
+  PerFrame perFrame;
+} pc;
+
+%TERRAIN_FUNC%
+
+void main() {
+  uint N = pc.perFrame.gridSize;
+  float s = pc.perFrame.fieldSize;
+
+  uint col = gl_VertexIndex / 2;
+  uint isTop = gl_VertexIndex % 2;
+  uint row = gl_InstanceIndex + isTop;
+
+  vec2 xz = vec2(float(col) / float(N), float(row) / float(N)) * 2.0 - 1.0;
+  xz *= s;
+
+  float y = terrainHeight(xz);
+  gl_Position = pc.perFrame.proj * pc.perFrame.view * vec4(xz.x, y, xz.y, 1.0);
+}
+)";
+
+// Shadow pass: depth-only grass vertex shader (light perspective)
+// Simplified: wind + arc bending + terrain offset + billboarding, no detail flutter or color
+const char* codeShadowGrassVS = R"(
+layout (set = 0, binding = 0) uniform texture2D kTextures2D[];
+layout (set = 0, binding = 1) uniform sampler   kSamplers[];
+
+struct GrassBlade {
+  float posX, posZ;
+  float height, width;
+  float lean, phase;
+  float stiffness;
+  float colorVariation;
+  float curvature;
+  float padding;
+};
+
+layout(std430, buffer_reference) readonly buffer PerFrame {
+  mat4 proj;
+  mat4 view;
+  mat4 light;
+  float time;
+  uint windTex;
+  uint windSamp;
+  float fieldSize;
+  uint gridSize;
+  uint texShadow;
+  uint sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  float padding2;
+};
+
+layout(std430, buffer_reference) readonly buffer BladeData {
+  GrassBlade blades[];
+};
+
+layout(push_constant) uniform constants {
+  PerFrame perFrame;
+  BladeData bladeData;
+} pc;
+
+%TERRAIN_FUNC%
+
+void main() {
+  GrassBlade blade = pc.bladeData.blades[gl_InstanceIndex];
+
+  int segment = gl_VertexIndex / 2;
+  int side = gl_VertexIndex % 2;
+  float t;
+  float widthScale;
+
+  if (gl_VertexIndex == 6) {
+    t = 1.0;
+    widthScale = 0.0;
+  } else {
+    t = float(segment) / 3.0;
+    widthScale = (side == 0) ? -1.0 : 1.0;
+  }
+
+  float taperRate = mix(0.5, 0.9, clamp(blade.height / 0.8, 0.0, 1.0));
+  float bladeWidth = blade.width * (1.0 - t * taperRate);
+
+  // sample wind texture
+  vec2 fieldUV = vec2(blade.posX, blade.posZ) / (2.0 * pc.perFrame.fieldSize) + 0.5;
+  vec4 windSample = texture(
+    nonuniformEXT(sampler2D(kTextures2D[pc.perFrame.windTex], kSamplers[pc.perFrame.windSamp])),
+    fieldUV);
+  vec2 windDisplacement = windSample.xy;
+
+  // wind-alignment attenuation
+  vec2 bladeDir = normalize(vec2(cos(blade.phase), sin(blade.phase)));
+  float windLen = length(windDisplacement);
+  float alignment = (windLen > 0.001)
+    ? 1.0 - 0.6 * abs(dot(bladeDir, windDisplacement / windLen))
+    : 1.0;
+
+  float bendFactor = t * t * t * alignment / blade.stiffness;
+
+  // billboard: orient blade width to face the light (via view matrix)
+  mat4 view = pc.perFrame.view;
+  vec2 camRightXZ = normalize(vec2(view[0][0], view[2][0]));
+  float halfW = widthScale * bladeWidth * 0.5;
+
+  // arc-based bending
+  vec2 restBend = bladeDir * blade.curvature;
+  vec2 totalBendXZ = restBend
+                   + windDisplacement * bendFactor
+                   + vec2(blade.lean * 0.3) * alignment;
+  float bendMag = length(totalBendXZ);
+
+  float h = blade.height;
+  float arcAngle = clamp(bendMag / max(h, 0.01), 0.0, 1.2) * t;
+  vec2 bendDir = (bendMag > 0.001) ? totalBendXZ / bendMag : vec2(1.0, 0.0);
+
+  float arcY = cos(arcAngle) * t * h;
+  float arcH = sin(arcAngle) * t * h;
+
+  vec3 pos;
+  pos.x = blade.posX + halfW * camRightXZ.x + bendDir.x * arcH;
+  pos.y = arcY;
+  pos.z = blade.posZ + halfW * camRightXZ.y + bendDir.y * arcH;
+
+  // terrain height offset
+  pos.y += terrainHeight(vec2(blade.posX, blade.posZ));
+
+  gl_Position = pc.perFrame.proj * pc.perFrame.view * vec4(pos, 1.0);
+}
+)";
+
+// Shadow pass: empty fragment shader (depth-only)
+const char* codeShadowFS = R"(
+void main() {}
 )";
 
 // clang-format on
@@ -317,15 +656,26 @@ struct GrassBlade {
   float lean, phase;
   float stiffness;
   float colorVariation;
+  float curvature;
+  float padding;
 };
 
 struct PerFrame {
   mat4 proj;
   mat4 view;
+  mat4 light;
   float time;
   uint32_t windTex;
   uint32_t windSamp;
   float fieldSize;
+  uint32_t gridSize;
+  uint32_t texShadow;
+  uint32_t sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  float padding2;
 };
 
 struct WindParams {
@@ -353,28 +703,54 @@ VULKAN_APP_MAIN {
 
   lvk::IContext* ctx = app.ctx_.get();
 
-  // Generate blade data
+  // Generate blade data with 3 grass types for meadow-like variety
   std::vector<GrassBlade> blades(kNumBlades);
   {
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> distPos(-kFieldSize, kFieldSize);
-    std::uniform_real_distribution<float> distHeight(0.15f, 0.55f);
-    std::uniform_real_distribution<float> distWidth(0.02f, 0.06f);
     std::uniform_real_distribution<float> distLean(-1.0f, 1.0f);
     std::uniform_real_distribution<float> distPhase(0.0f, 6.2831853f);
-    std::uniform_real_distribution<float> distStiff(0.5f, 2.0f);
     std::uniform_real_distribution<float> distColor(0.0f, 1.0f);
+    std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
+
+    // Type A: short grass (45%) — thin blades, stiff, slight droop
+    std::uniform_real_distribution<float> distHeightA(0.12f, 0.30f);
+    std::uniform_real_distribution<float> distWidthA(0.010f, 0.022f);
+    std::uniform_real_distribution<float> distStiffA(1.5f, 3.0f);
+    std::uniform_real_distribution<float> distCurvA(0.03f, 0.12f);
+
+    // Type B: medium grass (35%) — moderate height, slender
+    std::uniform_real_distribution<float> distHeightB(0.30f, 0.60f);
+    std::uniform_real_distribution<float> distWidthB(0.008f, 0.018f);
+    std::uniform_real_distribution<float> distStiffB(0.8f, 1.8f);
+    std::uniform_real_distribution<float> distCurvB(0.08f, 0.22f);
+
+    // Type C: tall grass (20%) — thin, flexible, graceful droop
+    std::uniform_real_distribution<float> distHeightC(0.55f, 1.00f);
+    std::uniform_real_distribution<float> distWidthC(0.006f, 0.014f);
+    std::uniform_real_distribution<float> distStiffC(0.4f, 1.0f);
+    std::uniform_real_distribution<float> distCurvC(0.15f, 0.40f);
 
     for (uint32_t i = 0; i < kNumBlades; i++) {
+      const float typeRoll = dist01(rng);
+      float h, w, stiff, curv;
+      if (typeRoll < 0.45f) {
+        h = distHeightA(rng); w = distWidthA(rng); stiff = distStiffA(rng); curv = distCurvA(rng);
+      } else if (typeRoll < 0.80f) {
+        h = distHeightB(rng); w = distWidthB(rng); stiff = distStiffB(rng); curv = distCurvB(rng);
+      } else {
+        h = distHeightC(rng); w = distWidthC(rng); stiff = distStiffC(rng); curv = distCurvC(rng);
+      }
       blades[i] = {
           .posX = distPos(rng),
           .posZ = distPos(rng),
-          .height = distHeight(rng),
-          .width = distWidth(rng),
+          .height = h,
+          .width = w,
           .lean = distLean(rng),
           .phase = distPhase(rng),
-          .stiffness = distStiff(rng),
+          .stiffness = stiff,
           .colorVariation = distColor(rng),
+          .curvature = curv,
       };
     }
   }
@@ -409,17 +785,64 @@ VULKAN_APP_MAIN {
       .debugName = "Sampler: wind",
   });
 
+  // Shadow map resources
+  constexpr uint32_t kShadowMapSize = 2048;
+
+  lvk::Holder<lvk::TextureHandle> shadowMap = ctx->createTexture({
+      .type = lvk::TextureType_2D,
+      .format = lvk::Format_Z_UN16,
+      .dimensions = {kShadowMapSize, kShadowMapSize},
+      .usage = lvk::TextureUsageBits_Attachment | lvk::TextureUsageBits_Sampled,
+      .numMipLevels = 1,
+      .debugName = "Texture: shadow map",
+  });
+
+  lvk::Holder<lvk::SamplerHandle> shadowSampler = ctx->createSampler({
+      .wrapU = lvk::SamplerWrap_Clamp,
+      .wrapV = lvk::SamplerWrap_Clamp,
+      .depthCompareOp = lvk::CompareOp_LessEqual,
+      .depthCompareEnabled = true,
+      .debugName = "Sampler: shadow",
+  });
+
+  lvk::Holder<lvk::BufferHandle> bufPerFrameShadow = ctx->createBuffer({
+      .usage = lvk::BufferUsageBits_Storage,
+      .storage = lvk::StorageType_HostVisible,
+      .size = sizeof(PerFrame),
+      .debugName = "Buffer: per frame (shadow)",
+  });
+
+  // Inject terrain function into shaders that use %TERRAIN_FUNC% placeholder
+  auto injectTerrain = [](const char* src) -> std::string {
+    std::string s(src);
+    const std::string placeholder = "%TERRAIN_FUNC%";
+    size_t pos = s.find(placeholder);
+    if (pos != std::string::npos)
+      s.replace(pos, placeholder.size(), codeTerrainFunc);
+    return s;
+  };
+  const std::string groundVS = injectTerrain(codeGroundVS);
+  const std::string grassVS = injectTerrain(codeGrassVS);
+  const std::string shadowGroundVS = injectTerrain(codeShadowGroundVS);
+  const std::string shadowGrassVS = injectTerrain(codeShadowGrassVS);
+
   // Shader modules
   lvk::Holder<lvk::ShaderModuleHandle> smWindComp =
       ctx->createShaderModule({codeWindCompute, lvk::Stage_Comp, "Shader Module: wind compute"});
   lvk::Holder<lvk::ShaderModuleHandle> smGroundVert =
-      ctx->createShaderModule({codeGroundVS, lvk::Stage_Vert, "Shader Module: ground (vert)"});
+      ctx->createShaderModule({groundVS.c_str(), lvk::Stage_Vert, "Shader Module: ground (vert)"});
   lvk::Holder<lvk::ShaderModuleHandle> smGroundFrag =
       ctx->createShaderModule({codeGroundFS, lvk::Stage_Frag, "Shader Module: ground (frag)"});
   lvk::Holder<lvk::ShaderModuleHandle> smGrassVert =
-      ctx->createShaderModule({codeGrassVS, lvk::Stage_Vert, "Shader Module: grass (vert)"});
+      ctx->createShaderModule({grassVS.c_str(), lvk::Stage_Vert, "Shader Module: grass (vert)"});
   lvk::Holder<lvk::ShaderModuleHandle> smGrassFrag =
       ctx->createShaderModule({codeGrassFS, lvk::Stage_Frag, "Shader Module: grass (frag)"});
+  lvk::Holder<lvk::ShaderModuleHandle> smShadowGroundVert =
+      ctx->createShaderModule({shadowGroundVS.c_str(), lvk::Stage_Vert, "Shader Module: shadow ground (vert)"});
+  lvk::Holder<lvk::ShaderModuleHandle> smShadowGrassVert =
+      ctx->createShaderModule({shadowGrassVS.c_str(), lvk::Stage_Vert, "Shader Module: shadow grass (vert)"});
+  lvk::Holder<lvk::ShaderModuleHandle> smShadowFrag =
+      ctx->createShaderModule({codeShadowFS, lvk::Stage_Frag, "Shader Module: shadow (frag)"});
 
   // Pipelines
   lvk::Holder<lvk::ComputePipelineHandle> pipelineWind = ctx->createComputePipeline({
@@ -432,8 +855,9 @@ VULKAN_APP_MAIN {
       .smVert = smGroundVert,
       .smFrag = smGroundFrag,
       .color = {{.format = ctx->getSwapchainFormat()}},
-      .depthFormat = app.getDepthFormat(),
+      .depthFormat = lvk::Format_Z_F32,
       .cullMode = lvk::CullMode_None,
+      .samplesCount = kMSAASamples,
       .debugName = "Pipeline: ground",
   });
 
@@ -442,37 +866,141 @@ VULKAN_APP_MAIN {
       .smVert = smGrassVert,
       .smFrag = smGrassFrag,
       .color = {{.format = ctx->getSwapchainFormat()}},
-      .depthFormat = app.getDepthFormat(),
+      .depthFormat = lvk::Format_Z_F32,
       .cullMode = lvk::CullMode_None,
+      .samplesCount = kMSAASamples,
       .debugName = "Pipeline: grass",
   });
 
-  // ImGui wind parameters
+  lvk::Holder<lvk::RenderPipelineHandle> pipelineShadowGround = ctx->createRenderPipeline({
+      .topology = lvk::Topology_TriangleStrip,
+      .smVert = smShadowGroundVert,
+      .smFrag = smShadowFrag,
+      .depthFormat = lvk::Format_Z_UN16,
+      .cullMode = lvk::CullMode_None,
+      .debugName = "Pipeline: shadow ground",
+  });
+
+  lvk::Holder<lvk::RenderPipelineHandle> pipelineShadowGrass = ctx->createRenderPipeline({
+      .topology = lvk::Topology_TriangleStrip,
+      .smVert = smShadowGrassVert,
+      .smFrag = smShadowFrag,
+      .depthFormat = lvk::Format_Z_UN16,
+      .cullMode = lvk::CullMode_None,
+      .debugName = "Pipeline: shadow grass",
+  });
+
+  // Light/shadow constants
+  const mat4 scaleBias = mat4(0.5, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 1, 0, 0.5, 0.5, 0, 1);
+
+  // ImGui parameters
   float windStrength = 0.5f;
   float windFrequency = 2.0f;
   float windSpeed = 1.5f;
   float gustStrength = 0.3f;
   float gustFrequency = 0.5f;
   float windAngle = 45.0f; // degrees
+  float depthBias = -0.0001f;
+  float sunElevation = 63.0f; // degrees from horizontal
+  float sunAzimuth = 53.0f;   // degrees around Y axis
+  bool showShadowMap = false;
+
+  // MSAA textures (recreated on resize)
+  lvk::Holder<lvk::TextureHandle> msaaColor;
+  lvk::Holder<lvk::TextureHandle> msaaDepth;
+  uint32_t msaaWidth = 0, msaaHeight = 0;
 
   app.run([&](uint32_t width, uint32_t height, float aspectRatio, float deltaSeconds) {
     LVK_PROFILER_FUNCTION();
 
+    // Recreate MSAA textures on resize
+    if (msaaWidth != width || msaaHeight != height) {
+      msaaWidth = width;
+      msaaHeight = height;
+      msaaColor = ctx->createTexture({
+          .type = lvk::TextureType_2D,
+          .format = ctx->getSwapchainFormat(),
+          .dimensions = {width, height},
+          .numSamples = kMSAASamples,
+          .usage = lvk::TextureUsageBits_Attachment,
+          .numMipLevels = 1,
+          .debugName = "Texture: MSAA color",
+      });
+      msaaDepth = ctx->createTexture({
+          .type = lvk::TextureType_2D,
+          .format = lvk::Format_Z_F32,
+          .dimensions = {width, height},
+          .numSamples = kMSAASamples,
+          .usage = lvk::TextureUsageBits_Attachment,
+          .numMipLevels = 1,
+          .debugName = "Texture: MSAA depth",
+      });
+    }
+
     const float fov = float(45.0f * (M_PI / 180.0f));
     const float currentTime = (float)glfwGetTime();
+
+    // Compute light direction from sun angles
+    const float elevRad = glm::radians(sunElevation);
+    const float aziRad = glm::radians(sunAzimuth);
+    const vec3 lightDir = normalize(vec3(
+        cosf(elevRad) * sinf(aziRad),
+        sinf(elevRad),
+        cosf(elevRad) * cosf(aziRad)));
+    const mat4 lightView = glm::lookAt(lightDir * 40.0f, vec3(0), vec3(0, 1, 0));
+
+    // Compute tight ortho frustum from scene AABB in light-view space
+    const vec3 sceneMin(-kFieldSize, -1.0f, -kFieldSize);
+    const vec3 sceneMax( kFieldSize,  2.0f,  kFieldSize);
+    vec3 lMin(FLT_MAX), lMax(-FLT_MAX);
+    for (int i = 0; i < 8; i++) {
+      const vec3 corner(
+          (i & 1) ? sceneMax.x : sceneMin.x,
+          (i & 2) ? sceneMax.y : sceneMin.y,
+          (i & 4) ? sceneMax.z : sceneMin.z);
+      const vec3 lc = vec3(lightView * vec4(corner, 1.0f));
+      lMin = glm::min(lMin, lc);
+      lMax = glm::max(lMax, lc);
+    }
+    const float nearPlane = -lMax.z - 1.0f;
+    const float farPlane = -lMin.z + 1.0f;
+    mat4 lightProj = glm::ortho(lMin.x, lMax.x, lMin.y, lMax.y, nearPlane, farPlane);
+    // Fix for Vulkan [0,1] depth range (GLM defaults to OpenGL [-1,1] which clips the near half of ortho frustums)
+    lightProj[2][2] = -1.0f / (farPlane - nearPlane);
+    lightProj[3][2] = -nearPlane / (farPlane - nearPlane);
 
     const PerFrame perFrame = {
         .proj = glm::perspective(fov, aspectRatio, 0.1f, 200.0f),
         .view = app.camera_.getViewMatrix(),
+        .light = scaleBias * lightProj * lightView,
         .time = currentTime,
         .windTex = windTexture.index(),
         .windSamp = windSampler.index(),
         .fieldSize = kFieldSize,
+        .gridSize = kGridSize,
+        .texShadow = shadowMap.index(),
+        .sampShadow = shadowSampler.index(),
+        .depthBias = depthBias,
+        .lightDirX = lightDir.x,
+        .lightDirY = lightDir.y,
+        .lightDirZ = lightDir.z,
+    };
+
+    const PerFrame perFrameShadow = {
+        .proj = lightProj,
+        .view = lightView,
+        .light = mat4(1.0f),
+        .time = currentTime,
+        .windTex = windTexture.index(),
+        .windSamp = windSampler.index(),
+        .fieldSize = kFieldSize,
+        .gridSize = kGridSize,
     };
 
     lvk::ICommandBuffer& buffer = ctx->acquireCommandBuffer();
 
     buffer.cmdUpdateBuffer(bufPerFrame, perFrame);
+    buffer.cmdUpdateBuffer(bufPerFrameShadow, perFrameShadow);
 
     // 1. Compute pass: generate wind texture
     {
@@ -495,64 +1023,134 @@ VULKAN_APP_MAIN {
           {(kWindTexSize + 15) / 16, (kWindTexSize + 15) / 16, 1});
     }
 
-    // 2. Render pass
-    lvk::Framebuffer framebuffer = {
-        .color = {{.texture = ctx->getCurrentSwapchainTexture()}},
-        .depthStencil = {app.getDepthTexture()},
-    };
-    buffer.cmdBeginRendering(
-        lvk::RenderPass{
-            .color = {{.loadOp = lvk::LoadOp_Clear, .storeOp = lvk::StoreOp_Store, .clearColor = {0.53f, 0.81f, 0.92f, 1.0f}}},
-            .depth = {.loadOp = lvk::LoadOp_Clear, .clearDepth = 1.0}},
-        framebuffer,
-        {.textures = {lvk::TextureHandle(windTexture)}});
+    // 2. Shadow pass: render depth from light perspective
     {
-      buffer.cmdBindViewport({0.0f, 0.0f, (float)width, (float)height, 0.0f, +1.0f});
-      buffer.cmdBindScissorRect({0, 0, width, height});
-      buffer.cmdBindDepthState({.compareOp = lvk::CompareOp_Less, .isDepthWriteEnabled = true});
-
-      // Draw ground plane
+      lvk::Framebuffer shadowFramebuffer = {
+          .depthStencil = {shadowMap},
+      };
+      buffer.cmdBeginRendering(
+          lvk::RenderPass{
+              .color = {},
+              .depth = {.loadOp = lvk::LoadOp_Clear, .storeOp = lvk::StoreOp_Store, .clearDepth = 1.0f}},
+          shadowFramebuffer,
+          {.textures = {lvk::TextureHandle(windTexture)}});
       {
-        buffer.cmdBindRenderPipeline(pipelineGround);
-        const struct {
-          uint64_t perFrame;
-        } groundPC = {
-            .perFrame = ctx->gpuAddress(bufPerFrame),
-        };
-        buffer.cmdPushConstants(groundPC);
-        buffer.cmdDraw(4);
-      }
+        buffer.cmdBindViewport({0.0f, 0.0f, (float)kShadowMapSize, (float)kShadowMapSize, 0.0f, +1.0f});
+        buffer.cmdBindScissorRect({0, 0, kShadowMapSize, kShadowMapSize});
+        buffer.cmdBindDepthState({.compareOp = lvk::CompareOp_Less, .isDepthWriteEnabled = true});
 
-      // Draw grass blades
-      {
-        buffer.cmdBindRenderPipeline(pipelineGrass);
-        const struct {
-          uint64_t perFrame;
-          uint64_t bladeData;
-        } grassPC = {
-            .perFrame = ctx->gpuAddress(bufPerFrame),
-            .bladeData = ctx->gpuAddress(bufBlades),
-        };
-        buffer.cmdPushConstants(grassPC);
-        buffer.cmdDraw(kBladesPerStrip, kNumBlades);
-      }
+        // Shadow ground
+        {
+          buffer.cmdBindRenderPipeline(pipelineShadowGround);
+          const struct {
+            uint64_t perFrame;
+          } shadowGroundPC = {
+              .perFrame = ctx->gpuAddress(bufPerFrameShadow),
+          };
+          buffer.cmdPushConstants(shadowGroundPC);
+          buffer.cmdDraw(2 * (kGridSize + 1), kGridSize);
+        }
 
-      // ImGui
-      app.imgui_->beginFrame(framebuffer);
-      ImGui::SetNextWindowPos({10, 10}, ImGuiCond_Once);
-      ImGui::SetNextWindowCollapsed(true, ImGuiCond_Once);
-      ImGui::Begin("Wind Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-      ImGui::SliderFloat("Wind Strength", &windStrength, 0.0f, 2.0f);
-      ImGui::SliderFloat("Wind Direction", &windAngle, 0.0f, 360.0f, "%.0f deg");
-      ImGui::SliderFloat("Wind Frequency", &windFrequency, 0.5f, 5.0f);
-      ImGui::SliderFloat("Wind Speed", &windSpeed, 0.5f, 5.0f);
-      ImGui::SliderFloat("Gust Strength", &gustStrength, 0.0f, 1.0f);
-      ImGui::SliderFloat("Gust Frequency", &gustFrequency, 0.1f, 2.0f);
-      ImGui::End();
-      app.drawFPS();
-      app.imgui_->endFrame(buffer);
+        // Shadow grass
+        {
+          buffer.cmdBindRenderPipeline(pipelineShadowGrass);
+          const struct {
+            uint64_t perFrame;
+            uint64_t bladeData;
+          } shadowGrassPC = {
+              .perFrame = ctx->gpuAddress(bufPerFrameShadow),
+              .bladeData = ctx->gpuAddress(bufBlades),
+          };
+          buffer.cmdPushConstants(shadowGrassPC);
+          buffer.cmdDraw(kBladesPerStrip, kNumBlades);
+        }
+      }
+      buffer.cmdEndRendering();
+      buffer.transitionToShaderReadOnly(shadowMap);
     }
-    buffer.cmdEndRendering();
+
+    // 3. Main render pass (4x MSAA → resolve to swapchain)
+    {
+      lvk::Framebuffer framebuffer = {
+          .color = {{.texture = msaaColor, .resolveTexture = ctx->getCurrentSwapchainTexture()}},
+          .depthStencil = {msaaDepth},
+      };
+      buffer.cmdBeginRendering(
+          lvk::RenderPass{
+              .color = {{.loadOp = lvk::LoadOp_Clear, .storeOp = lvk::StoreOp_MsaaResolve, .clearColor = {0.53f, 0.81f, 0.92f, 1.0f}}},
+              .depth = {.loadOp = lvk::LoadOp_Clear, .clearDepth = 1.0}},
+          framebuffer,
+          {.textures = {lvk::TextureHandle(windTexture)}});
+      {
+        buffer.cmdBindViewport({0.0f, 0.0f, (float)width, (float)height, 0.0f, +1.0f});
+        buffer.cmdBindScissorRect({0, 0, width, height});
+        buffer.cmdBindDepthState({.compareOp = lvk::CompareOp_Less, .isDepthWriteEnabled = true});
+
+        // Draw ground plane
+        {
+          buffer.cmdBindRenderPipeline(pipelineGround);
+          const struct {
+            uint64_t perFrame;
+          } groundPC = {
+              .perFrame = ctx->gpuAddress(bufPerFrame),
+          };
+          buffer.cmdPushConstants(groundPC);
+          buffer.cmdDraw(2 * (kGridSize + 1), kGridSize);
+        }
+
+        // Draw grass blades
+        {
+          buffer.cmdBindRenderPipeline(pipelineGrass);
+          const struct {
+            uint64_t perFrame;
+            uint64_t bladeData;
+          } grassPC = {
+              .perFrame = ctx->gpuAddress(bufPerFrame),
+              .bladeData = ctx->gpuAddress(bufBlades),
+          };
+          buffer.cmdPushConstants(grassPC);
+          buffer.cmdDraw(kBladesPerStrip, kNumBlades);
+        }
+      }
+      buffer.cmdEndRendering();
+    }
+
+    // 4. ImGui pass (1x, draws over resolved swapchain)
+    {
+      lvk::Framebuffer framebuffer = {
+          .color = {{.texture = ctx->getCurrentSwapchainTexture()}},
+      };
+      buffer.cmdBeginRendering(
+          lvk::RenderPass{
+              .color = {{.loadOp = lvk::LoadOp_Load, .storeOp = lvk::StoreOp_Store}}},
+          framebuffer);
+      {
+        app.imgui_->beginFrame(framebuffer);
+        ImGui::SetNextWindowPos({10, 10}, ImGuiCond_Once);
+        ImGui::SetNextWindowCollapsed(true, ImGuiCond_Once);
+        ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+        ImGui::Text("Wind");
+        ImGui::SliderFloat("Wind Strength", &windStrength, 0.0f, 2.0f);
+        ImGui::SliderFloat("Wind Direction", &windAngle, 0.0f, 360.0f, "%.0f deg");
+        ImGui::SliderFloat("Wind Frequency", &windFrequency, 0.5f, 5.0f);
+        ImGui::SliderFloat("Wind Speed", &windSpeed, 0.5f, 5.0f);
+        ImGui::SliderFloat("Gust Strength", &gustStrength, 0.0f, 1.0f);
+        ImGui::SliderFloat("Gust Frequency", &gustFrequency, 0.1f, 2.0f);
+        ImGui::Separator();
+        ImGui::Text("Sun / Shadow");
+        ImGui::SliderFloat("Sun Elevation", &sunElevation, 5.0f, 89.0f, "%.0f deg");
+        ImGui::SliderFloat("Sun Azimuth", &sunAzimuth, 0.0f, 360.0f, "%.0f deg");
+        ImGui::SliderFloat("Depth Bias", &depthBias, -0.001f, 0.001f, "%.5f");
+        ImGui::Checkbox("Show Shadow Map", &showShadowMap);
+        if (showShadowMap) {
+          ImGui::Image(shadowMap.index(), ImVec2(256, 256));
+        }
+        ImGui::End();
+        app.drawFPS();
+        app.imgui_->endFrame(buffer);
+      }
+      buffer.cmdEndRendering();
+    }
 
     ctx->submit(buffer, ctx->getCurrentSwapchainTexture());
   });
