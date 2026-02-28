@@ -236,22 +236,33 @@ void main() {
   vec2 camRightXZ = normalize(vec2(view[0][0], view[2][0]));
   float halfW = widthScale * bladeWidth * 0.5;
 
+  // --- arc-based bending ---
+  // compute total horizontal bend at this vertex's height as an arc angle
+  // wind bend + lean + detail flutter all contribute to the bend direction
+  vec2 totalBendXZ = windDisplacement * bendFactor
+                   + vec2(blade.lean * 0.3) * alignment
+                   + vec2(detailLateral, detailLateral * 0.7) * detailAtten;
+  float bendMag = length(totalBendXZ);
+
+  // convert displacement to arc angle (clamp to prevent over-rotation)
+  // angle = displacement / radius, where radius = blade height
+  float h = blade.height;
+  float arcAngle = clamp(bendMag / max(h, 0.01), 0.0, 1.2) * t;
+
+  // bend direction in XZ plane
+  vec2 bendDir = (bendMag > 0.001) ? totalBendXZ / bendMag : vec2(1.0, 0.0);
+
+  // rotate the vertex along the bend arc: base stays fixed, upper verts arc over
+  // sin(angle) = horizontal offset, cos(angle) = height factor
+  float arcY = cos(arcAngle) * t * h;
+  float arcH = sin(arcAngle) * t * h;
+
   vec3 pos;
-  pos.x = blade.posX + halfW * camRightXZ.x;
-  pos.y = t * blade.height;
-  pos.z = blade.posZ + halfW * camRightXZ.y;
+  pos.x = blade.posX + halfW * camRightXZ.x + bendDir.x * arcH;
+  pos.y = arcY;
+  pos.z = blade.posZ + halfW * camRightXZ.y + bendDir.y * arcH;
 
-  // apply lean along camera right
-  pos.x += blade.lean * t * 0.3 * camRightXZ.x;
-  pos.z += blade.lean * t * 0.3 * camRightXZ.y;
-
-  // apply main wind bending
-  pos.x += windDisplacement.x * bendFactor;
-  pos.z += windDisplacement.y * bendFactor;
-
-  // apply detail flutter (lateral along wind direction, vertical bob)
-  pos.x += detailLateral * detailAtten;
-  pos.z += detailLateral * detailAtten * 0.7;
+  // detail vertical bob
   pos.y += detailVertical * detailAtten;
 
   // color: dark green at base, bright green at tip with variation
