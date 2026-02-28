@@ -132,6 +132,7 @@ const char* codeGroundVS = R"(
 layout (location=0) out vec2 v_WorldXZ;
 layout (location=1) out vec3 v_Normal;
 layout (location=2) out vec4 v_ShadowCoords;
+layout (location=3) out vec3 v_WorldPos;
 
 layout(std430, buffer_reference) readonly buffer PerFrame {
   mat4 proj;
@@ -172,8 +173,9 @@ void main() {
   float y = terrainHeight(xz);
   v_WorldXZ = xz;
   v_Normal = terrainNormal(xz);
-  v_ShadowCoords = pc.perFrame.light * vec4(xz.x, y, xz.y, 1.0);
-  gl_Position = pc.perFrame.proj * pc.perFrame.view * vec4(xz.x, y, xz.y, 1.0);
+  v_WorldPos = vec3(xz.x, y, xz.y);
+  v_ShadowCoords = pc.perFrame.light * vec4(v_WorldPos, 1.0);
+  gl_Position = pc.perFrame.proj * pc.perFrame.view * vec4(v_WorldPos, 1.0);
 }
 )";
 
@@ -182,6 +184,7 @@ const char* codeGroundFS = R"(
 layout (location=0) in vec2 v_WorldXZ;
 layout (location=1) in vec3 v_Normal;
 layout (location=2) in vec4 v_ShadowCoords;
+layout (location=3) in vec3 v_WorldPos;
 layout (location=0) out vec4 out_FragColor;
 
 layout(std430, buffer_reference) readonly buffer PerFrame {
@@ -219,7 +222,7 @@ float shadow(vec4 s) {
   s = s / s.w;
   if (s.z > -1.0 && s.z < 1.0) {
     float shadowSample = PCF3(vec3(s.x, 1.0 - s.y, s.z + pc.perFrame.depthBias));
-    return mix(0.3, 1.0, shadowSample);
+    return mix(0.4, 1.0, shadowSample);
   }
   return 1.0;
 }
@@ -227,14 +230,30 @@ float shadow(vec4 s) {
 void main() {
   // earthy brown with subtle variation
   float n = fract(sin(dot(floor(v_WorldXZ * 4.0), vec2(12.9898, 78.233))) * 43758.5453);
-  vec3 brown = mix(vec3(0.28, 0.20, 0.10), vec3(0.35, 0.25, 0.12), n);
+  vec3 albedo = mix(vec3(0.28, 0.20, 0.10), vec3(0.35, 0.25, 0.12), n);
 
-  // directional light on terrain
-  vec3 lightDir = normalize(vec3(pc.perFrame.lightDirX, pc.perFrame.lightDirY, pc.perFrame.lightDirZ));
-  float NdotL = max(dot(normalize(v_Normal), lightDir), 0.0);
-  float lighting = 0.35 + 0.65 * NdotL;
+  vec3 N = normalize(v_Normal);
+  vec3 L = normalize(vec3(pc.perFrame.lightDirX, pc.perFrame.lightDirY, pc.perFrame.lightDirZ));
+  vec3 camPos = -(transpose(mat3(pc.perFrame.view)) * vec3(pc.perFrame.view[3]));
+  vec3 V = normalize(camPos - v_WorldPos);
 
-  out_FragColor = vec4(brown * lighting * shadow(v_ShadowCoords), 1.0);
+  // hemisphere ambient: sky blue from above, warm ground bounce from below
+  float skyBlend = N.y * 0.5 + 0.5;
+  vec3 ambient = mix(vec3(0.10, 0.08, 0.05), vec3(0.20, 0.25, 0.35), skyBlend);
+
+  // wrapped diffuse (softer shadow transition than hard Lambertian)
+  vec3 sunColor = vec3(1.4, 1.3, 1.1);
+  float wrapDiffuse = max(0.0, (dot(N, L) + 0.3) / 1.3);
+  vec3 diffuse = sunColor * wrapDiffuse;
+
+  // subtle specular (moist earth sheen)
+  vec3 H = normalize(L + V);
+  float spec = pow(max(dot(N, H), 0.0), 24.0) * 0.08;
+
+  float shd = shadow(v_ShadowCoords);
+
+  vec3 color = albedo * (ambient + diffuse * shd) + sunColor * spec * shd;
+  out_FragColor = vec4(color, 1.0);
 }
 )";
 
@@ -249,6 +268,7 @@ layout (location=1) out float v_AO;
 layout (location=2) out vec3 v_Normal;
 layout (location=3) out float v_BendAmount;
 layout (location=4) out vec4 v_ShadowCoords;
+layout (location=5) out vec3 v_WorldPos;
 
 struct GrassBlade {
   float posX, posZ;
@@ -422,6 +442,7 @@ void main() {
   vec3 faceNormal = vec3(-camRightXZ.y, 0.0, camRightXZ.x); // perpendicular to camRight in XZ
   v_Normal = normalize(faceNormal * widthScale * 0.3 + vec3(windDisplacement.x * 0.2, 1.0, windDisplacement.y * 0.2));
 
+  v_WorldPos = pos;
   v_ShadowCoords = pc.perFrame.light * vec4(pos, 1.0);
   gl_Position = pc.perFrame.proj * pc.perFrame.view * vec4(pos, 1.0);
 }
@@ -434,6 +455,7 @@ layout (location=1) in float v_AO;
 layout (location=2) in vec3 v_Normal;
 layout (location=3) in float v_BendAmount;
 layout (location=4) in vec4 v_ShadowCoords;
+layout (location=5) in vec3 v_WorldPos;
 layout (location=0) out vec4 out_FragColor;
 
 layout(std430, buffer_reference) readonly buffer PerFrame {
@@ -471,21 +493,45 @@ float shadow(vec4 s) {
   s = s / s.w;
   if (s.z > -1.0 && s.z < 1.0) {
     float shadowSample = PCF3(vec3(s.x, 1.0 - s.y, s.z + pc.perFrame.depthBias));
-    return mix(0.3, 1.0, shadowSample);
+    return mix(0.4, 1.0, shadowSample);
   }
   return 1.0;
 }
 
 void main() {
-  // simple directional light
-  vec3 lightDir = normalize(vec3(pc.perFrame.lightDirX, pc.perFrame.lightDirY, pc.perFrame.lightDirZ));
-  float NdotL = max(dot(normalize(v_Normal), lightDir), 0.0);
-  float lighting = 0.3 + 0.7 * NdotL; // ambient + diffuse
+  vec3 N = normalize(v_Normal);
+  vec3 L = normalize(vec3(pc.perFrame.lightDirX, pc.perFrame.lightDirY, pc.perFrame.lightDirZ));
+  vec3 camPos = -(transpose(mat3(pc.perFrame.view)) * vec3(pc.perFrame.view[3]));
+  vec3 V = normalize(camPos - v_WorldPos);
+
+  // hemisphere ambient: sky blue from above, warm ground bounce from below
+  float skyBlend = N.y * 0.5 + 0.5;
+  vec3 ambient = mix(vec3(0.10, 0.08, 0.05), vec3(0.18, 0.22, 0.30), skyBlend);
+
+  // wrapped diffuse (softer than hard Lambertian cutoff)
+  vec3 sunColor = vec3(1.4, 1.3, 1.1);
+  float wrapDiffuse = max(0.0, (dot(N, L) + 0.4) / 1.4);
+  vec3 diffuse = sunColor * wrapDiffuse;
+
+  // subsurface translucency: light transmits through thin blades when backlit
+  vec3 transLightDir = L + N * 0.3;
+  float transDot = max(0.0, dot(-normalize(transLightDir), V));
+  float translucency = pow(transDot, 6.0) * 0.5;
+  translucency *= v_AO; // tips are thinner, transmit more light
+  vec3 transColor = v_Color * sunColor * translucency;
+
+  // subtle Blinn-Phong specular (blade sheen)
+  vec3 H = normalize(L + V);
+  float spec = pow(max(dot(N, H), 0.0), 32.0) * 0.12;
 
   // wind-driven AO: bent blades darken (self-shadowing)
   float windAO = 1.0 - clamp(v_BendAmount * 0.6, 0.0, 0.35);
 
-  vec3 color = v_Color * lighting * v_AO * windAO * shadow(v_ShadowCoords);
+  float shd = shadow(v_ShadowCoords);
+
+  vec3 color = v_Color * (ambient + diffuse * shd) * v_AO * windAO
+             + transColor * shd
+             + sunColor * spec * shd;
   out_FragColor = vec4(color, 1.0);
 }
 )";
