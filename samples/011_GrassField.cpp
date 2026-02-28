@@ -200,8 +200,16 @@ void main() {
     fieldUV);
   vec2 windDisplacement = windSample.xy;
 
+  // wind-alignment attenuation: blades facing into/away from wind bend less
+  // than blades perpendicular to it (Jahrmann-Wimmer model)
+  vec2 bladeDir = normalize(vec2(cos(blade.phase), sin(blade.phase)));
+  float windLen = length(windDisplacement);
+  float alignment = (windLen > 0.001)
+    ? 1.0 - 0.6 * abs(dot(bladeDir, windDisplacement / windLen))
+    : 1.0;
+
   // --- main bending: smooth cubic arc from wind ---
-  float bendFactor = t * t * t / blade.stiffness;
+  float bendFactor = t * t * t * alignment / blade.stiffness;
 
   // --- detail flutter: 4 SmoothTriangleWaves at different frequencies (Crysis model) ---
   // per-blade phase from world position + random phase; per-vertex variation from segment
