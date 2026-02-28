@@ -73,6 +73,14 @@ void main() {
   // slow-scrolling layered wind: primary direction + secondary cross-flow
   float t = pc.time * pc.windSpeed * 0.15;
   vec2 windUV = uv * pc.windFreq + vec2(t, t * 0.6);
+
+  // domain warp: distort sampling coords with high-freq noise scaled by wind strength
+  // produces turbulent eddies at strong wind (Ghost of Tsushima technique)
+  float warpScale = 0.4 * pc.windStrength;
+  vec2 warpUV = uv * pc.windFreq * 3.0 + vec2(pc.time * 0.2, pc.time * 0.15);
+  vec2 warp = vec2(gradientNoise(warpUV), gradientNoise(warpUV + vec2(7.3, 2.9)));
+  windUV += warp * warpScale;
+
   float windX = fbm(windUV);
   float windZ = fbm(windUV + vec2(5.2, 1.3));
 
