@@ -191,11 +191,28 @@ void main() {
     fieldUV);
   vec2 windDisplacement = windSample.xy;
 
-  // smooth cubic bending from wind
+  // --- main bending: smooth cubic arc from wind ---
   float bendFactor = t * t * t / blade.stiffness;
-  // gentle per-blade sway (slow, unique per blade)
-  float swayPhase = pc.perFrame.time * 0.8 + blade.phase;
-  float sway = sin(swayPhase) * 0.03 * t * t;
+
+  // --- detail flutter: 4 SmoothTriangleWaves at different frequencies (Crysis model) ---
+  // per-blade phase from world position + random phase; per-vertex variation from segment
+  float objPhase = blade.posX * 0.7 + blade.posZ * 1.3 + blade.phase;
+  float vtxPhase = float(segment) * 0.37 + objPhase;
+  float time = pc.perFrame.time;
+
+  // SmoothTriangleWave: abs(frac(x+0.5)*2-1) smoothed by x*x*(3-2*x)
+  vec4 wavesIn = vec4(vtxPhase + time, objPhase + time,
+                      vtxPhase + time, objPhase + time);
+  vec4 freqs = vec4(1.975, 0.793, 0.375, 0.193);
+  vec4 waves = fract(wavesIn * freqs) * 2.0 - 1.0;       // triangle wave
+  waves = abs(waves);
+  waves = waves * waves * (3.0 - 2.0 * waves) * 2.0 - 1.0; // smooth + remap to [-1,1]
+
+  // combine: x-pair for lateral flutter, y-pair for vertical bob
+  float detailLateral = (waves.x + waves.y) * 0.015;
+  float detailVertical = (waves.z + waves.w) * 0.008;
+  // only upper segments flutter (scale by t^2), attenuated by stiffness
+  float detailAtten = t * t / blade.stiffness;
 
   // billboard: orient blade width to face the camera (XZ plane only)
   mat4 view = pc.perFrame.view;
@@ -211,9 +228,14 @@ void main() {
   pos.x += blade.lean * t * 0.3 * camRightXZ.x;
   pos.z += blade.lean * t * 0.3 * camRightXZ.y;
 
-  // apply wind bending
-  pos.x += windDisplacement.x * bendFactor + sway;
+  // apply main wind bending
+  pos.x += windDisplacement.x * bendFactor;
   pos.z += windDisplacement.y * bendFactor;
+
+  // apply detail flutter (lateral along wind direction, vertical bob)
+  pos.x += detailLateral * detailAtten;
+  pos.z += detailLateral * detailAtten * 0.7;
+  pos.y += detailVertical * detailAtten;
 
   // color: dark green at base, bright green at tip with variation
   vec3 baseColor = mix(vec3(0.05, 0.15, 0.02), vec3(0.10, 0.20, 0.03), blade.colorVariation);
@@ -278,8 +300,8 @@ struct WindParams {
 
 VULKAN_APP_MAIN {
   const VulkanAppConfig cfg{
-      .width = 1280,
-      .height = 1024,
+      .width = -90,
+      .height = -90,
       .resizable = true,
       .initialCameraPos = vec3(0.0f, 3.0f, 8.0f),
       .initialCameraTarget = vec3(0.0f, 0.0f, 0.0f),
