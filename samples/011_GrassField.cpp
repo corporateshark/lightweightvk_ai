@@ -16,6 +16,10 @@ constexpr uint32_t kWindTexSize = 256;
 constexpr uint32_t kBladesPerStrip = 7;
 constexpr uint32_t kGridSize = 128; // terrain grid: kGridSize x kGridSize quads
 constexpr uint32_t kMSAASamples = 4;
+constexpr uint32_t kNumTrees = 150;
+constexpr uint32_t kTrunkSides = 12;
+constexpr uint32_t kTrunkVertsPerSegment = (kTrunkSides + 1) * 2; // 26 (triangle strip)
+constexpr uint32_t kLeafVerts = 4; // billboard quad (triangle strip)
 
 // clang-format off
 
@@ -855,6 +859,638 @@ void main() {
 }
 )";
 
+// Tree trunk vertex shader: procedural octagonal cylinder from segment data
+const char* codeTrunkVS = R"(
+layout (set = 0, binding = 0) uniform texture2D kTextures2D[];
+layout (set = 0, binding = 1) uniform sampler   kSamplers[];
+
+layout (location=0) out vec3 v_Normal;
+layout (location=1) out vec4 v_ShadowCoords;
+layout (location=2) out vec3 v_WorldPos;
+layout (location=3) out float v_Height;
+layout (location=4) flat out float v_TreeType;
+
+struct TreeTrunkSegment {
+  float startX, startY, startZ, startRadius;
+  float endX, endY, endZ, endRadius;
+  float baseX, baseY, baseZ, treeType;
+  float refRX, refRY, refRZ, refRPad;
+};
+
+layout(std430, buffer_reference) readonly buffer PerFrame {
+  mat4 proj;
+  mat4 view;
+  mat4 light;
+  float time;
+  uint windTex;
+  uint windSamp;
+  float fieldSize;
+  uint gridSize;
+  uint texShadow;
+  uint sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  uint texSSAO;
+  uint sampSSAO;
+  float padding2;
+  float padding3;
+  float padding4;
+};
+
+layout(std430, buffer_reference) readonly buffer SegmentData {
+  TreeTrunkSegment segments[];
+};
+
+layout(push_constant) uniform constants {
+  PerFrame perFrame;
+  SegmentData segmentData;
+} pc;
+
+void main() {
+  TreeTrunkSegment seg = pc.segmentData.segments[gl_InstanceIndex];
+
+  const int NUM_SIDES = 12;
+  int pairIndex = gl_VertexIndex / 2;
+  int isTop = gl_VertexIndex & 1;
+
+  float angle = float(pairIndex) / float(NUM_SIDES) * 6.2831853;
+  float ca = cos(angle);
+  float sa = sin(angle);
+
+  vec3 sPos = vec3(seg.startX, seg.startY, seg.startZ);
+  vec3 ePos = vec3(seg.endX, seg.endY, seg.endZ);
+
+  vec3 up = normalize(ePos - sPos);
+  vec3 refR = vec3(seg.refRX, seg.refRY, seg.refRZ);
+  vec3 right = normalize(refR - up * dot(refR, up));
+  vec3 fwd = cross(right, up);
+
+  float radius = (isTop == 1) ? seg.endRadius : seg.startRadius;
+  vec3 offset = (right * ca + fwd * sa) * radius;
+  vec3 center = (isTop == 1) ? ePos : sPos;
+  vec3 pos = center + offset;
+
+  vec2 fieldUV = vec2(seg.baseX, seg.baseZ) / (2.0 * pc.perFrame.fieldSize) + 0.5;
+  vec2 wind = texture(
+    nonuniformEXT(sampler2D(kTextures2D[pc.perFrame.windTex], kSamplers[pc.perFrame.windSamp])),
+    fieldUV).xy;
+
+  float h = pos.y - seg.baseY;
+  pos.x += wind.x * h * h * 0.015;
+  pos.z += wind.y * h * h * 0.015;
+
+  float flutter = sin(pc.perFrame.time * 4.0 + pos.x * 8.0 + pos.z * 6.0)
+                * 0.002 * h * min(1.0 / max(radius, 0.005) * 0.02, 1.0);
+  pos.x += flutter;
+  pos.z += flutter * 0.7;
+
+  v_Normal = normalize(right * ca + fwd * sa);
+  v_WorldPos = pos;
+  v_ShadowCoords = pc.perFrame.light * vec4(pos, 1.0);
+  v_Height = pos.y;
+  v_TreeType = seg.treeType;
+
+  gl_Position = pc.perFrame.proj * pc.perFrame.view * vec4(pos, 1.0);
+}
+)";
+
+// Tree trunk fragment shader: bark lighting with per-type color
+const char* codeTrunkFS = R"(
+layout (location=0) in vec3 v_Normal;
+layout (location=1) in vec4 v_ShadowCoords;
+layout (location=2) in vec3 v_WorldPos;
+layout (location=3) in float v_Height;
+layout (location=4) flat in float v_TreeType;
+layout (location=0) out vec4 out_FragColor;
+
+layout(std430, buffer_reference) readonly buffer PerFrame {
+  mat4 proj;
+  mat4 view;
+  mat4 light;
+  float time;
+  uint windTex;
+  uint windSamp;
+  float fieldSize;
+  uint gridSize;
+  uint texShadow;
+  uint sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  uint texSSAO;
+  uint sampSSAO;
+  float padding2;
+  float padding3;
+  float padding4;
+};
+
+layout(push_constant) uniform constants {
+  PerFrame perFrame;
+} pc;
+
+float PCF3(vec3 uvw) {
+  float size = 0.5 / textureBindlessSize2D(pc.perFrame.texShadow).x;
+  float shadow = 0.0;
+  for (int v=-1; v<=+1; v++)
+    for (int u=-1; u<=+1; u++)
+      shadow += textureBindless2DShadow(pc.perFrame.texShadow, pc.perFrame.sampShadow, uvw + size * vec3(u, v, 0));
+  return shadow / 9;
+}
+
+float shadow(vec4 s) {
+  s = s / s.w;
+  if (s.z > -1.0 && s.z < 1.0) {
+    float shadowSample = PCF3(vec3(s.x, 1.0 - s.y, s.z + pc.perFrame.depthBias));
+    return mix(0.4, 1.0, shadowSample);
+  }
+  return 1.0;
+}
+
+void main() {
+  vec3 N = normalize(v_Normal);
+  vec3 L = normalize(vec3(pc.perFrame.lightDirX, pc.perFrame.lightDirY, pc.perFrame.lightDirZ));
+  vec3 camPos = -(transpose(mat3(pc.perFrame.view)) * vec3(pc.perFrame.view[3]));
+  vec3 V = normalize(camPos - v_WorldPos);
+
+  // bark albedo: per-type color with noise and height variation
+  float n = fract(sin(dot(v_WorldPos.xz * 8.0, vec2(12.9898, 78.233))) * 43758.5453);
+  int tt = int(v_TreeType + 0.5);
+  vec3 barkA, barkB;
+  if (tt == 1) {        // Maple: grey-brown
+    barkA = vec3(0.30, 0.25, 0.20);
+    barkB = vec3(0.42, 0.35, 0.28);
+  } else if (tt == 2) { // Birch: pale white-grey
+    barkA = vec3(0.65, 0.62, 0.58);
+    barkB = vec3(0.80, 0.78, 0.72);
+  } else {              // Oak: classic brown
+    barkA = vec3(0.25, 0.15, 0.08);
+    barkB = vec3(0.35, 0.22, 0.10);
+  }
+  vec3 albedo = mix(barkA, barkB, n);
+  albedo *= mix(0.85, 1.0, fract(v_Height * 3.0));
+
+  float skyBlend = N.y * 0.5 + 0.5;
+  vec3 ambient = mix(vec3(0.10, 0.08, 0.05), vec3(0.20, 0.25, 0.35), skyBlend);
+
+  vec3 sunColor = vec3(1.4, 1.3, 1.1);
+  float wrapDiffuse = max(0.0, (dot(N, L) + 0.3) / 1.3);
+  vec3 diffuse = sunColor * wrapDiffuse;
+
+  float shd = shadow(v_ShadowCoords);
+
+  vec2 ssaoUV = gl_FragCoord.xy / vec2(textureBindlessSize2D(pc.perFrame.texSSAO));
+  float ao = textureBindless2D(pc.perFrame.texSSAO, pc.perFrame.sampSSAO, ssaoUV).r;
+
+  vec3 color = albedo * (ambient * ao + diffuse * shd);
+  out_FragColor = vec4(color, 1.0);
+}
+)";
+
+// Tree leaf vertex shader: billboard quad from leaf data
+const char* codeLeafVS = R"(
+layout (set = 0, binding = 0) uniform texture2D kTextures2D[];
+layout (set = 0, binding = 1) uniform sampler   kSamplers[];
+
+layout (location=0) out vec2 v_UV;
+layout (location=1) out vec3 v_Color;
+layout (location=2) out vec4 v_ShadowCoords;
+layout (location=3) out vec3 v_WorldPos;
+layout (location=4) flat out float v_LeafType;
+
+struct TreeLeaf {
+  float posX, posY, posZ, size;
+  float phase, colorVar, dirTheta, dirPhi;
+};
+
+layout(std430, buffer_reference) readonly buffer PerFrame {
+  mat4 proj;
+  mat4 view;
+  mat4 light;
+  float time;
+  uint windTex;
+  uint windSamp;
+  float fieldSize;
+  uint gridSize;
+  uint texShadow;
+  uint sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  uint texSSAO;
+  uint sampSSAO;
+  float padding2;
+  float padding3;
+  float padding4;
+};
+
+layout(std430, buffer_reference) readonly buffer LeafData {
+  TreeLeaf leaves[];
+};
+
+layout(push_constant) uniform constants {
+  PerFrame perFrame;
+  LeafData leafData;
+} pc;
+
+void main() {
+  TreeLeaf leaf = pc.leafData.leaves[gl_InstanceIndex];
+
+  float u = float(gl_VertexIndex & 1);
+  float v = float(gl_VertexIndex >> 1);
+  v_UV = vec2(u, v);
+
+  mat4 view = pc.perFrame.view;
+
+  // Fixed leaf orientation from stored spherical coords
+  float theta = leaf.dirTheta;
+  float phi = leaf.dirPhi;
+  vec3 leafUp = vec3(sin(phi) * cos(theta), cos(phi), sin(phi) * sin(theta));
+  vec3 leafRight = normalize(cross(vec3(0.0, 1.0, 0.0), leafUp));
+  // handle degenerate case when leafUp is parallel to world up
+  if (length(cross(vec3(0.0, 1.0, 0.0), leafUp)) < 0.001)
+    leafRight = vec3(1.0, 0.0, 0.0);
+
+  // Camera-facing axes
+  vec3 camRight = vec3(view[0][0], view[1][0], view[2][0]);
+  vec3 camUp = vec3(view[0][1], view[1][1], view[2][1]);
+
+  // Blend: 35% camera bias for visibility, 65% fixed for depth/parallax
+  vec3 right = normalize(mix(leafRight, camRight, 0.35));
+  vec3 up = normalize(mix(leafUp, camUp, 0.35));
+
+  vec3 center = vec3(leaf.posX, leaf.posY, leaf.posZ);
+
+  // Wind-texture sway (synchronized with grass/trunks)
+  vec2 fieldUV = vec2(leaf.posX, leaf.posZ) / (2.0 * pc.perFrame.fieldSize) + 0.5;
+  vec2 wind = texture(
+    nonuniformEXT(sampler2D(kTextures2D[pc.perFrame.windTex], kSamplers[pc.perFrame.windSamp])),
+    fieldUV).xy;
+
+  float h = center.y;
+  center.x += wind.x * h * h * 0.015;
+  center.z += wind.y * h * h * 0.015;
+
+  // Local leaf flutter (wind-modulated amplitude)
+  float flutter = sin(pc.perFrame.time * 2.5 + leaf.phase) * 0.02 * (1.0 + length(wind) * 0.5);
+  center.x += flutter;
+  center.z += flutter * 0.7;
+
+  vec3 pos = center + (u - 0.5) * leaf.size * right + (v - 0.5) * leaf.size * up;
+
+  // Per-type leaf color: cv encodes type in [0,0.33), [0.33,0.66), [0.66,1.0)
+  float cv = leaf.colorVar;
+  vec3 leafColor;
+  float leafType;
+  if (cv < 0.333) {
+    // Oak: warm greens
+    float t = cv / 0.333;
+    leafColor = mix(vec3(0.08, 0.28, 0.03), vec3(0.30, 0.50, 0.10), t);
+    leafType = 0.0;
+  } else if (cv < 0.666) {
+    // Maple: autumn greens to orange-red
+    float t = (cv - 0.333) / 0.333;
+    leafColor = mix(vec3(0.20, 0.35, 0.05), vec3(0.55, 0.25, 0.05), t);
+    leafType = 1.0;
+  } else {
+    // Birch: bright yellow-greens
+    float t = (cv - 0.666) / 0.334;
+    leafColor = mix(vec3(0.25, 0.50, 0.08), vec3(0.50, 0.58, 0.15), t);
+    leafType = 2.0;
+  }
+  v_Color = leafColor;
+  v_LeafType = leafType;
+
+  v_WorldPos = pos;
+  v_ShadowCoords = pc.perFrame.light * vec4(pos, 1.0);
+  gl_Position = pc.perFrame.proj * pc.perFrame.view * vec4(pos, 1.0);
+}
+)";
+
+// Tree leaf fragment shader: per-type leaf shapes with foliage lighting
+const char* codeLeafFS = R"(
+layout (location=0) in vec2 v_UV;
+layout (location=1) in vec3 v_Color;
+layout (location=2) in vec4 v_ShadowCoords;
+layout (location=3) in vec3 v_WorldPos;
+layout (location=4) flat in float v_LeafType;
+layout (location=0) out vec4 out_FragColor;
+
+layout(std430, buffer_reference) readonly buffer PerFrame {
+  mat4 proj;
+  mat4 view;
+  mat4 light;
+  float time;
+  uint windTex;
+  uint windSamp;
+  float fieldSize;
+  uint gridSize;
+  uint texShadow;
+  uint sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  uint texSSAO;
+  uint sampSSAO;
+  float padding2;
+  float padding3;
+  float padding4;
+};
+
+layout(push_constant) uniform constants {
+  PerFrame perFrame;
+} pc;
+
+float PCF3(vec3 uvw) {
+  float size = 1.0 / textureBindlessSize2D(pc.perFrame.texShadow).x;
+  float shadow = 0.0;
+  for (int v=-1; v<=+1; v++)
+    for (int u=-1; u<=+1; u++)
+      shadow += textureBindless2DShadow(pc.perFrame.texShadow, pc.perFrame.sampShadow, uvw + size * vec3(u, v, 0));
+  return shadow / 9;
+}
+
+float shadow(vec4 s) {
+  s = s / s.w;
+  if (s.z > -1.0 && s.z < 1.0) {
+    float shadowSample = PCF3(vec3(s.x, 1.0 - s.y, s.z + pc.perFrame.depthBias));
+    return mix(0.4, 1.0, shadowSample);
+  }
+  return 1.0;
+}
+
+void main() {
+  float vn = v_UV.y;  // 0=stem, 1=tip
+  float dx = (v_UV.x - 0.5) * 2.0;  // [-1,1] from center
+  int lt = int(v_LeafType + 0.5);
+
+  // Per-type leaf width profiles
+  float w;
+  if (lt == 1) {
+    // Maple: broad, wide leaf with subtle lobes
+    float base = pow(vn + 0.001, 0.3) * pow(max(1.0 - vn, 0.0), 1.2) / 0.30;
+    float lobe = 1.0 + 0.15 * sin(vn * 9.0); // subtle lobe undulation
+    w = base * lobe;
+  } else if (lt == 2) {
+    // Birch: small round/oval leaf
+    w = pow(vn + 0.001, 0.5) * pow(max(1.0 - vn, 0.0), 1.0) / 0.35;
+  } else {
+    // Oak: elongated pointed leaf
+    w = pow(vn + 0.001, 0.4) * pow(max(1.0 - vn, 0.0), 1.8) / 0.33;
+  }
+
+  if (abs(dx) > w * 0.95 || vn < 0.01) discard;
+
+  // Central vein darkening
+  float veinDist = abs(dx);
+  float veinWidth = 0.06 * (1.0 - vn * 0.7);
+  float vein = smoothstep(veinWidth, veinWidth * 0.2, veinDist);
+
+  vec3 L = normalize(vec3(pc.perFrame.lightDirX, pc.perFrame.lightDirY, pc.perFrame.lightDirZ));
+  vec3 camPos = -(transpose(mat3(pc.perFrame.view)) * vec3(pc.perFrame.view[3]));
+  vec3 V = normalize(camPos - v_WorldPos);
+  vec3 N = V; // billboard faces camera
+
+  float skyBlend = 0.75;
+  vec3 ambient = mix(vec3(0.10, 0.08, 0.05), vec3(0.18, 0.22, 0.30), skyBlend);
+
+  vec3 sunColor = vec3(1.4, 1.3, 1.1);
+  float NdotL = dot(N, L);
+  float wrapDiffuse = max(0.0, (abs(NdotL) + 0.4) / 1.4);
+  vec3 diffuse = sunColor * wrapDiffuse;
+
+  // subsurface translucency
+  float trans = pow(max(0.0, dot(-L, V)), 4.0) * 0.3;
+  vec3 transColor = v_Color * sunColor * trans;
+
+  float shd = shadow(v_ShadowCoords);
+
+  vec2 ssaoUV = gl_FragCoord.xy / vec2(textureBindlessSize2D(pc.perFrame.texSSAO));
+  float ao = textureBindless2D(pc.perFrame.texSSAO, pc.perFrame.sampSSAO, ssaoUV).r;
+
+  // Apply vein darkening and height-based brightness
+  vec3 leafColor = v_Color * (1.0 - vein * 0.2);
+  float heightBright = 1.0 + v_WorldPos.y * 0.05;
+  leafColor *= heightBright;
+
+  vec3 color = leafColor * (ambient * ao + diffuse * shd) + transColor * shd;
+  out_FragColor = vec4(color, 1.0);
+}
+)";
+
+// Shadow pass: depth-only trunk vertex shader
+const char* codeShadowTrunkVS = R"(
+layout (set = 0, binding = 0) uniform texture2D kTextures2D[];
+layout (set = 0, binding = 1) uniform sampler   kSamplers[];
+
+struct TreeTrunkSegment {
+  float startX, startY, startZ, startRadius;
+  float endX, endY, endZ, endRadius;
+  float baseX, baseY, baseZ, treeType;
+  float refRX, refRY, refRZ, refRPad;
+};
+
+layout(std430, buffer_reference) readonly buffer PerFrame {
+  mat4 proj;
+  mat4 view;
+  mat4 light;
+  float time;
+  uint windTex;
+  uint windSamp;
+  float fieldSize;
+  uint gridSize;
+  uint texShadow;
+  uint sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  uint texSSAO;
+  uint sampSSAO;
+  float padding2;
+  float padding3;
+  float padding4;
+};
+
+layout(std430, buffer_reference) readonly buffer SegmentData {
+  TreeTrunkSegment segments[];
+};
+
+layout(push_constant) uniform constants {
+  PerFrame perFrame;
+  SegmentData segmentData;
+} pc;
+
+void main() {
+  TreeTrunkSegment seg = pc.segmentData.segments[gl_InstanceIndex];
+
+  const int NUM_SIDES = 12;
+  int pairIndex = gl_VertexIndex / 2;
+  int isTop = gl_VertexIndex & 1;
+
+  float angle = float(pairIndex) / float(NUM_SIDES) * 6.2831853;
+
+  vec3 sPos = vec3(seg.startX, seg.startY, seg.startZ);
+  vec3 ePos = vec3(seg.endX, seg.endY, seg.endZ);
+
+  vec3 up = normalize(ePos - sPos);
+  vec3 refR = vec3(seg.refRX, seg.refRY, seg.refRZ);
+  vec3 right = normalize(refR - up * dot(refR, up));
+  vec3 fwd = cross(right, up);
+
+  float radius = (isTop == 1) ? seg.endRadius : seg.startRadius;
+  vec3 offset = (right * cos(angle) + fwd * sin(angle)) * radius;
+  vec3 center = (isTop == 1) ? ePos : sPos;
+  vec3 pos = center + offset;
+
+  vec2 fieldUV = vec2(seg.baseX, seg.baseZ) / (2.0 * pc.perFrame.fieldSize) + 0.5;
+  vec2 wind = texture(
+    nonuniformEXT(sampler2D(kTextures2D[pc.perFrame.windTex], kSamplers[pc.perFrame.windSamp])),
+    fieldUV).xy;
+
+  float h = pos.y - seg.baseY;
+  pos.x += wind.x * h * h * 0.015;
+  pos.z += wind.y * h * h * 0.015;
+
+  float flutter = sin(pc.perFrame.time * 4.0 + pos.x * 8.0 + pos.z * 6.0)
+                * 0.002 * h * min(1.0 / max(radius, 0.005) * 0.02, 1.0);
+  pos.x += flutter;
+  pos.z += flutter * 0.7;
+
+  gl_Position = pc.perFrame.proj * pc.perFrame.view * vec4(pos, 1.0);
+}
+)";
+
+// Shadow pass: depth-only leaf vertex shader (billboard + UV for alpha cutout)
+const char* codeShadowLeafVS = R"(
+layout (set = 0, binding = 0) uniform texture2D kTextures2D[];
+layout (set = 0, binding = 1) uniform sampler   kSamplers[];
+
+layout (location=0) out vec2 v_UV;
+layout (location=1) flat out float v_LeafType;
+
+struct TreeLeaf {
+  float posX, posY, posZ, size;
+  float phase, colorVar, dirTheta, dirPhi;
+};
+
+layout(std430, buffer_reference) readonly buffer PerFrame {
+  mat4 proj;
+  mat4 view;
+  mat4 light;
+  float time;
+  uint windTex;
+  uint windSamp;
+  float fieldSize;
+  uint gridSize;
+  uint texShadow;
+  uint sampShadow;
+  float depthBias;
+  float lightDirX;
+  float lightDirY;
+  float lightDirZ;
+  uint texSSAO;
+  uint sampSSAO;
+  float padding2;
+  float padding3;
+  float padding4;
+};
+
+layout(std430, buffer_reference) readonly buffer LeafData {
+  TreeLeaf leaves[];
+};
+
+layout(push_constant) uniform constants {
+  PerFrame perFrame;
+  LeafData leafData;
+} pc;
+
+void main() {
+  TreeLeaf leaf = pc.leafData.leaves[gl_InstanceIndex];
+
+  float u = float(gl_VertexIndex & 1);
+  float v = float(gl_VertexIndex >> 1);
+  v_UV = vec2(u, v);
+
+  mat4 view = pc.perFrame.view;
+
+  // Fixed leaf orientation from stored spherical coords
+  float theta = leaf.dirTheta;
+  float phi = leaf.dirPhi;
+  vec3 leafUp = vec3(sin(phi) * cos(theta), cos(phi), sin(phi) * sin(theta));
+  vec3 leafRight = normalize(cross(vec3(0.0, 1.0, 0.0), leafUp));
+  if (length(cross(vec3(0.0, 1.0, 0.0), leafUp)) < 0.001)
+    leafRight = vec3(1.0, 0.0, 0.0);
+
+  // Camera-facing axes
+  vec3 camRight = vec3(view[0][0], view[1][0], view[2][0]);
+  vec3 camUp = vec3(view[0][1], view[1][1], view[2][1]);
+
+  // Blend: 35% camera bias for visibility, 65% fixed for depth/parallax
+  vec3 right = normalize(mix(leafRight, camRight, 0.35));
+  vec3 up = normalize(mix(leafUp, camUp, 0.35));
+
+  vec3 center = vec3(leaf.posX, leaf.posY, leaf.posZ);
+
+  // Wind-texture sway (synchronized with grass/trunks)
+  vec2 fieldUV = vec2(leaf.posX, leaf.posZ) / (2.0 * pc.perFrame.fieldSize) + 0.5;
+  vec2 wind = texture(
+    nonuniformEXT(sampler2D(kTextures2D[pc.perFrame.windTex], kSamplers[pc.perFrame.windSamp])),
+    fieldUV).xy;
+
+  float h = center.y;
+  center.x += wind.x * h * h * 0.015;
+  center.z += wind.y * h * h * 0.015;
+
+  // Local leaf flutter (wind-modulated amplitude)
+  float flutter = sin(pc.perFrame.time * 2.5 + leaf.phase) * 0.02 * (1.0 + length(wind) * 0.5);
+  center.x += flutter;
+  center.z += flutter * 0.7;
+
+  vec3 pos = center + (u - 0.5) * leaf.size * right + (v - 0.5) * leaf.size * up;
+
+  // Compute leaf type from colorVar bands
+  float cv = leaf.colorVar;
+  if (cv < 0.333) v_LeafType = 0.0;
+  else if (cv < 0.666) v_LeafType = 1.0;
+  else v_LeafType = 2.0;
+
+  gl_Position = pc.perFrame.proj * pc.perFrame.view * vec4(pos, 1.0);
+}
+)";
+
+// Shadow pass: leaf fragment shader (per-type leaf cutout)
+const char* codeShadowLeafFS = R"(
+layout (location=0) in vec2 v_UV;
+layout (location=1) flat in float v_LeafType;
+
+void main() {
+  float vn = v_UV.y;
+  float dx = (v_UV.x - 0.5) * 2.0;
+  int lt = int(v_LeafType + 0.5);
+
+  float w;
+  if (lt == 1) {
+    // Maple: broad with subtle lobes
+    float base = pow(vn + 0.001, 0.3) * pow(max(1.0 - vn, 0.0), 1.2) / 0.30;
+    float lobe = 1.0 + 0.15 * sin(vn * 9.0);
+    w = base * lobe;
+  } else if (lt == 2) {
+    // Birch: small round/oval
+    w = pow(vn + 0.001, 0.5) * pow(max(1.0 - vn, 0.0), 1.0) / 0.35;
+  } else {
+    // Oak: elongated pointed
+    w = pow(vn + 0.001, 0.4) * pow(max(1.0 - vn, 0.0), 1.8) / 0.33;
+  }
+
+  if (abs(dx) > w * 0.95 || vn < 0.01) discard;
+}
+)";
+
 // SSAO blur compute shader: 5x5 box blur
 const char* codeSSAOBlurCompute = R"(
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -936,6 +1572,25 @@ struct WindParams {
   uint32_t texSize;
 };
 
+struct TreeTrunkSegment {
+  float startX, startY, startZ, startRadius;
+  float endX, endY, endZ, endRadius;
+  float baseX, baseY, baseZ, treeType;
+  float refRX, refRY, refRZ, refRPad;
+};
+
+struct TreeLeaf {
+  float posX, posY, posZ, size;
+  float phase, colorVar, dirTheta, dirPhi;
+};
+
+float terrainHeightCPP(float px, float pz) {
+  return 0.45f * sinf(px * 0.25f) * sinf(pz * 0.20f)
+       + 0.25f * sinf(px * 0.55f + 1.3f) * sinf(pz * 0.45f + 2.1f)
+       + 0.12f * sinf(px * 1.1f + 3.7f) * cosf(pz * 0.9f + 0.8f)
+       + 0.06f * cosf(px * 2.3f + 0.5f) * sinf(pz * 1.8f + 1.5f);
+}
+
 VULKAN_APP_MAIN {
   const VulkanAppConfig cfg{
       .width = -90,
@@ -1008,6 +1663,270 @@ VULKAN_APP_MAIN {
       .debugName = "Buffer: blade data",
   });
 
+  // Generate tree data with recursive branching
+  std::vector<TreeTrunkSegment> trunkSegments;
+  std::vector<TreeLeaf> treeLeaves;
+  {
+    std::mt19937 treeRng(123);
+    std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
+    std::uniform_real_distribution<float> distPhase(0.0f, 6.2831853f);
+
+    // Procedurally place trees with minimum spacing
+    std::uniform_real_distribution<float> distTree(-kFieldSize + 1.0f, kFieldSize - 1.0f);
+    std::vector<vec3> treeBasePositions;
+    treeBasePositions.reserve(kNumTrees);
+    const float minDist = 1.8f;
+    while (treeBasePositions.size() < kNumTrees) {
+      vec3 candidate(distTree(treeRng), 0.0f, distTree(treeRng));
+      bool tooClose = false;
+      for (const auto& p : treeBasePositions) {
+        float dx = candidate.x - p.x, dz = candidate.z - p.z;
+        if (dx * dx + dz * dz < minDist * minDist) { tooClose = true; break; }
+      }
+      if (!tooClose) treeBasePositions.push_back(candidate);
+    }
+
+    // Helper: compute initial reference right for a direction
+    auto computeRefRight = [](vec3 dir) -> vec3 {
+      vec3 arb = fabsf(dir.y) < 0.99f ? vec3(0, 1, 0) : vec3(1, 0, 0);
+      return glm::normalize(glm::cross(dir, arb));
+    };
+
+    // Helper: spawn a cluster of leaves at a point
+    auto spawnLeaves = [&](vec3 pos, int count, float sizeMin, float sizeRange,
+                           float clusterRadius, float cvBase, float cvRange, float yBias) {
+      for (int i = 0; i < count; i++) {
+        float theta = distPhase(treeRng);
+        float phi = dist01(treeRng) * 1.5708f;
+        float r = clusterRadius * (0.3f + dist01(treeRng) * 0.7f);
+        vec3 offset(
+            r * sinf(phi) * cosf(theta),
+            r * cosf(phi) * 0.7f * yBias + 0.03f,
+            r * sinf(phi) * sinf(theta));
+        float leafDirTheta = distPhase(treeRng);
+        float leafDirPhi = 0.3f + dist01(treeRng) * 1.0f;
+        float cv = cvBase + dist01(treeRng) * cvRange;
+        treeLeaves.push_back({
+            pos.x + offset.x, pos.y + offset.y, pos.z + offset.z,
+            sizeMin + dist01(treeRng) * sizeRange,
+            distPhase(treeRng), cv, leafDirTheta, leafDirPhi,
+        });
+      }
+    };
+
+    // --- OAK generator: wide rounded canopy, leaves from depth 2+ ---
+    auto generateOak = [&](vec3 base, float trunkHeight, float trunkRadius, vec3 trunkDir, vec3 refRight) {
+      float tt = 0.0f;
+      std::function<void(vec3, vec3, float, float, int, vec3)> growOak;
+      growOak = [&](vec3 start, vec3 dir, float length, float radius, int depth, vec3 curRight) {
+        int numSubSegs = (depth <= 1) ? 4 : 3;
+        float endRadius = radius * 0.80f;
+        float subLen = length / (float)numSubSegs;
+        curRight = glm::normalize(curRight - dir * glm::dot(curRight, dir));
+        vec3 segStart = start;
+        for (int s = 0; s < numSubSegs; s++) {
+          float t0 = (float)s / (float)numSubSegs;
+          float t1 = (float)(s + 1) / (float)numSubSegs;
+          trunkSegments.push_back({
+              segStart.x, segStart.y, segStart.z, glm::mix(radius, endRadius, t0),
+              (segStart + dir * subLen).x, (segStart + dir * subLen).y, (segStart + dir * subLen).z, glm::mix(radius, endRadius, t1),
+              base.x, base.y, base.z, tt,
+              curRight.x, curRight.y, curRight.z, 0.0f,
+          });
+          segStart = segStart + dir * subLen;
+        }
+        vec3 end = segStart;
+
+        // Spawn leaves at depth >= 2 (fills the full rounded canopy)
+        if (depth >= 2) {
+          float depthFrac = (float)(depth - 2) / 2.0f; // 0 at depth 2, 1 at depth 4
+          int leafCount = (int)(60.0f + 100.0f * depthFrac + dist01(treeRng) * 40.0f);
+          spawnLeaves(end, leafCount, 0.03f, 0.03f, 0.25f + 0.15f * depthFrac, 0.0f, 0.333f, 1.0f);
+        }
+
+        if (depth >= 4) return;
+
+        int numChildren = 2 + (dist01(treeRng) > 0.5f ? 1 : 0);
+        for (int i = 0; i < numChildren; i++) {
+          float spreadAngle = 0.35f + dist01(treeRng) * 0.40f;
+          float rotAngle = distPhase(treeRng);
+          vec3 fwd = glm::cross(curRight, dir);
+          vec3 childDir = glm::normalize(
+              dir + (curRight * cosf(rotAngle) + fwd * sinf(rotAngle)) * tanf(spreadAngle) + vec3(0, 0.05f, 0));
+          float childLength = length * (0.55f + dist01(treeRng) * 0.25f);
+          vec3 childRight = glm::normalize(curRight - childDir * glm::dot(curRight, childDir));
+          growOak(end, childDir, childLength, endRadius, depth + 1, childRight);
+        }
+      };
+      growOak(base, trunkDir, trunkHeight, trunkRadius, 0, refRight);
+    };
+
+    // --- PINE generator: conical shape with central leader + whorled horizontal branches ---
+    // --- MAPLE generator: medium tree, broad rounded canopy, layered branches ---
+    auto generateMaple = [&](vec3 base, float trunkHeight, float trunkRadius, vec3 trunkDir, vec3 refRight) {
+      float tt = 1.0f;
+      std::function<void(vec3, vec3, float, float, int, vec3)> growMaple;
+      growMaple = [&](vec3 start, vec3 dir, float length, float radius, int depth, vec3 curRight) {
+        int numSubSegs = (depth <= 1) ? 5 : 3;
+        float subLen = length / (float)numSubSegs;
+        float endRadius = radius * 0.65f;
+        vec3 segStart = start;
+        for (int s = 0; s < numSubSegs; s++) {
+          float t0 = (float)s / (float)numSubSegs;
+          float t1 = (float)(s + 1) / (float)numSubSegs;
+          vec3 segEnd = segStart + dir * subLen;
+          trunkSegments.push_back({
+              segStart.x, segStart.y, segStart.z, glm::mix(radius, endRadius, t0),
+              segEnd.x, segEnd.y, segEnd.z, glm::mix(radius, endRadius, t1),
+              base.x, base.y, base.z, tt,
+              curRight.x, curRight.y, curRight.z, 0.0f,
+          });
+          segStart = segEnd;
+        }
+
+        int maxDepth = 4;
+        if (depth >= maxDepth) return;
+
+        // Spawn leaves from depth 2+ (broad canopy fill)
+        if (depth >= 2) {
+          vec3 leafCenter = start + dir * (length * 0.5f);
+          int leafCount = (depth >= 3) ? (60 + (int)(dist01(treeRng) * 40.0f)) : (30 + (int)(dist01(treeRng) * 20.0f));
+          float leafSpread = length * 0.6f;
+          spawnLeaves(leafCenter, leafCount, 0.03f, 0.02f, leafSpread, 0.333f, 0.333f, 1.0f);
+        }
+
+        // Branch into 2-3 children with wide spread (maple has broad canopy)
+        int numChildren = 2 + (dist01(treeRng) < 0.5f ? 1 : 0);
+        for (int c = 0; c < numChildren; c++) {
+          float childLen = length * (0.6f + dist01(treeRng) * 0.15f);
+          float childRadius = endRadius;
+
+          // Wide horizontal spread for broad rounded canopy
+          float spreadAngle = 0.35f + dist01(treeRng) * 0.40f;
+          float rotAngle = 6.2831853f * (float)c / (float)numChildren + (dist01(treeRng) - 0.5f) * 0.5f;
+
+          // Build child direction: spread from parent + slight upward bias
+          vec3 fwd = glm::normalize(dir);
+          vec3 rgt = glm::normalize(curRight - fwd * glm::dot(curRight, fwd));
+          vec3 upV = glm::normalize(glm::cross(fwd, rgt));
+
+          vec3 childDir = fwd * cosf(spreadAngle) +
+                          (rgt * cosf(rotAngle) + upV * sinf(rotAngle)) * sinf(spreadAngle);
+          // Slight upward bias to keep canopy rounded
+          childDir.y += 0.15f;
+          childDir = glm::normalize(childDir);
+
+          vec3 childRight = glm::normalize(rgt - childDir * glm::dot(rgt, childDir));
+          if (glm::length(childRight) < 0.001f) childRight = rgt;
+
+          growMaple(segStart, childDir, childLen, childRadius, depth + 1, childRight);
+        }
+      };
+
+      growMaple(base, trunkDir, trunkHeight, trunkRadius, 0, refRight);
+    };
+
+    // --- BIRCH generator: tall thin trunk, drooping leaf clusters from depth 2+ ---
+    auto generateBirch = [&](vec3 base, float trunkHeight, float trunkRadius, vec3 trunkDir, vec3 refRight) {
+      float tt = 2.0f;
+      std::function<void(vec3, vec3, float, float, int, vec3)> growBirch;
+      growBirch = [&](vec3 start, vec3 dir, float length, float radius, int depth, vec3 curRight) {
+        int numSubSegs = (depth <= 1) ? 4 : 3;
+        float endRadius = radius * 0.78f;
+        float subLen = length / (float)numSubSegs;
+        curRight = glm::normalize(curRight - dir * glm::dot(curRight, dir));
+        vec3 segStart = start;
+        for (int s = 0; s < numSubSegs; s++) {
+          float t0 = (float)s / (float)numSubSegs;
+          float t1 = (float)(s + 1) / (float)numSubSegs;
+          vec3 segEnd = segStart + dir * subLen;
+          trunkSegments.push_back({
+              segStart.x, segStart.y, segStart.z, glm::mix(radius, endRadius, t0),
+              segEnd.x, segEnd.y, segEnd.z, glm::mix(radius, endRadius, t1),
+              base.x, base.y, base.z, tt,
+              curRight.x, curRight.y, curRight.z, 0.0f,
+          });
+          segStart = segEnd;
+        }
+        vec3 end = segStart;
+
+        // Spawn drooping leaf clusters from depth 2+ (yBias < 1 = hang downward)
+        if (depth >= 2) {
+          float depthFrac = (float)(depth - 2) / 2.0f;
+          int leafCount = (int)(50.0f + 80.0f * depthFrac + dist01(treeRng) * 30.0f);
+          // Drooping: yBias 0.3 = clusters extend more sideways/downward
+          spawnLeaves(end, leafCount, 0.04f, 0.03f, 0.20f + 0.15f * depthFrac, 0.666f, 0.334f, 0.3f);
+        }
+
+        if (depth >= 4) return;
+
+        // Birch: more horizontal branching, slight droop
+        int numChildren = 2 + (dist01(treeRng) > 0.4f ? 1 : 0);
+        for (int i = 0; i < numChildren; i++) {
+          float spreadAngle = 0.30f + dist01(treeRng) * 0.45f;
+          float rotAngle = distPhase(treeRng);
+          vec3 fwd = glm::cross(curRight, dir);
+          vec3 childDir = glm::normalize(
+              dir + (curRight * cosf(rotAngle) + fwd * sinf(rotAngle)) * tanf(spreadAngle) + vec3(0, -0.05f, 0)); // slight droop
+          float childLength = length * (0.55f + dist01(treeRng) * 0.25f);
+          vec3 childRight = glm::normalize(curRight - childDir * glm::dot(curRight, childDir));
+          growBirch(end, childDir, childLength, endRadius, depth + 1, childRight);
+        }
+      };
+      growBirch(base, trunkDir, trunkHeight, trunkRadius, 0, refRight);
+    };
+
+    for (uint32_t t = 0; t < kNumTrees; t++) {
+      vec3 base = treeBasePositions[t];
+      base.y = terrainHeightCPP(base.x, base.z);
+
+      // Assign tree type: ~40% oak, ~30% maple, ~30% birch
+      float typeRoll = dist01(treeRng);
+      int treeType = (typeRoll < 0.4f) ? 0 : (typeRoll < 0.7f) ? 1 : 2;
+
+      vec3 trunkDir(0.0f, 1.0f, 0.0f);
+      trunkDir.x += (dist01(treeRng) - 0.5f) * 0.1f;
+      trunkDir.z += (dist01(treeRng) - 0.5f) * 0.1f;
+      trunkDir = glm::normalize(trunkDir);
+      vec3 refR = computeRefRight(trunkDir);
+
+      if (treeType == 0) {
+        // Oak: medium, wide rounded canopy
+        float h = 0.7f + dist01(treeRng) * 0.6f;
+        float r = 0.06f + dist01(treeRng) * 0.04f;
+        generateOak(base, h, r, trunkDir, refR);
+      } else if (treeType == 1) {
+        // Maple: medium, broad rounded canopy
+        float h = 0.9f + dist01(treeRng) * 0.6f;
+        float r = 0.05f + dist01(treeRng) * 0.04f;
+        generateMaple(base, h, r, trunkDir, refR);
+      } else {
+        // Birch: tall thin trunk, drooping canopy
+        float h = 1.0f + dist01(treeRng) * 0.7f;
+        float r = 0.03f + dist01(treeRng) * 0.02f;
+        generateBirch(base, h, r, trunkDir, refR);
+      }
+    }
+  }
+  const uint32_t totalTrunkSegments = (uint32_t)trunkSegments.size();
+  const uint32_t totalLeaves = (uint32_t)treeLeaves.size();
+
+  lvk::Holder<lvk::BufferHandle> bufTrunkSegments = ctx->createBuffer({
+      .usage = lvk::BufferUsageBits_Storage,
+      .storage = lvk::StorageType_Device,
+      .size = trunkSegments.size() * sizeof(TreeTrunkSegment),
+      .data = trunkSegments.data(),
+      .debugName = "Buffer: trunk segments",
+  });
+
+  lvk::Holder<lvk::BufferHandle> bufLeaves = ctx->createBuffer({
+      .usage = lvk::BufferUsageBits_Storage,
+      .storage = lvk::StorageType_Device,
+      .size = treeLeaves.size() * sizeof(TreeLeaf),
+      .data = treeLeaves.data(),
+      .debugName = "Buffer: tree leaves",
+  });
+
   lvk::Holder<lvk::BufferHandle> bufPerFrame = ctx->createBuffer({
       .usage = lvk::BufferUsageBits_Storage,
       .storage = lvk::StorageType_HostVisible,
@@ -1031,7 +1950,7 @@ VULKAN_APP_MAIN {
   });
 
   // Shadow map resources
-  constexpr uint32_t kShadowMapSize = 2048;
+  constexpr uint32_t kShadowMapSize = 4096;
 
   lvk::Holder<lvk::TextureHandle> shadowMap = ctx->createTexture({
       .type = lvk::TextureType_2D,
@@ -1112,6 +2031,22 @@ VULKAN_APP_MAIN {
   lvk::Holder<lvk::ShaderModuleHandle> smSSAOBlurComp =
       ctx->createShaderModule({codeSSAOBlurCompute, lvk::Stage_Comp, "Shader Module: SSAO blur compute"});
 
+  // Tree shader modules
+  lvk::Holder<lvk::ShaderModuleHandle> smTrunkVert =
+      ctx->createShaderModule({codeTrunkVS, lvk::Stage_Vert, "Shader Module: trunk (vert)"});
+  lvk::Holder<lvk::ShaderModuleHandle> smTrunkFrag =
+      ctx->createShaderModule({codeTrunkFS, lvk::Stage_Frag, "Shader Module: trunk (frag)"});
+  lvk::Holder<lvk::ShaderModuleHandle> smLeafVert =
+      ctx->createShaderModule({codeLeafVS, lvk::Stage_Vert, "Shader Module: leaf (vert)"});
+  lvk::Holder<lvk::ShaderModuleHandle> smLeafFrag =
+      ctx->createShaderModule({codeLeafFS, lvk::Stage_Frag, "Shader Module: leaf (frag)"});
+  lvk::Holder<lvk::ShaderModuleHandle> smShadowTrunkVert =
+      ctx->createShaderModule({codeShadowTrunkVS, lvk::Stage_Vert, "Shader Module: shadow trunk (vert)"});
+  lvk::Holder<lvk::ShaderModuleHandle> smShadowLeafVert =
+      ctx->createShaderModule({codeShadowLeafVS, lvk::Stage_Vert, "Shader Module: shadow leaf (vert)"});
+  lvk::Holder<lvk::ShaderModuleHandle> smShadowLeafFrag =
+      ctx->createShaderModule({codeShadowLeafFS, lvk::Stage_Frag, "Shader Module: shadow leaf (frag)"});
+
   // Pipelines
   lvk::Holder<lvk::ComputePipelineHandle> pipelineWind = ctx->createComputePipeline({
       .smComp = smWindComp,
@@ -1175,6 +2110,67 @@ VULKAN_APP_MAIN {
       .depthFormat = lvk::Format_Z_F32,
       .cullMode = lvk::CullMode_None,
       .debugName = "Pipeline: depth prepass grass",
+  });
+
+  // Tree pipelines (main pass)
+  lvk::Holder<lvk::RenderPipelineHandle> pipelineTrunk = ctx->createRenderPipeline({
+      .topology = lvk::Topology_TriangleStrip,
+      .smVert = smTrunkVert,
+      .smFrag = smTrunkFrag,
+      .color = {{.format = ctx->getSwapchainFormat()}},
+      .depthFormat = lvk::Format_Z_F32,
+      .cullMode = lvk::CullMode_Back,
+      .samplesCount = kMSAASamples,
+      .debugName = "Pipeline: trunk",
+  });
+
+  lvk::Holder<lvk::RenderPipelineHandle> pipelineLeaf = ctx->createRenderPipeline({
+      .topology = lvk::Topology_TriangleStrip,
+      .smVert = smLeafVert,
+      .smFrag = smLeafFrag,
+      .color = {{.format = ctx->getSwapchainFormat()}},
+      .depthFormat = lvk::Format_Z_F32,
+      .cullMode = lvk::CullMode_None,
+      .samplesCount = kMSAASamples,
+      .debugName = "Pipeline: leaf",
+  });
+
+  // Tree pipelines (shadow pass)
+  lvk::Holder<lvk::RenderPipelineHandle> pipelineShadowTrunk = ctx->createRenderPipeline({
+      .topology = lvk::Topology_TriangleStrip,
+      .smVert = smShadowTrunkVert,
+      .smFrag = smShadowFrag,
+      .depthFormat = lvk::Format_Z_UN16,
+      .cullMode = lvk::CullMode_Back,
+      .debugName = "Pipeline: shadow trunk",
+  });
+
+  lvk::Holder<lvk::RenderPipelineHandle> pipelineShadowLeaf = ctx->createRenderPipeline({
+      .topology = lvk::Topology_TriangleStrip,
+      .smVert = smShadowLeafVert,
+      .smFrag = smShadowLeafFrag,
+      .depthFormat = lvk::Format_Z_UN16,
+      .cullMode = lvk::CullMode_None,
+      .debugName = "Pipeline: shadow leaf",
+  });
+
+  // Tree pipelines (depth prepass for SSAO)
+  lvk::Holder<lvk::RenderPipelineHandle> pipelineDepthTrunk = ctx->createRenderPipeline({
+      .topology = lvk::Topology_TriangleStrip,
+      .smVert = smShadowTrunkVert,
+      .smFrag = smShadowFrag,
+      .depthFormat = lvk::Format_Z_F32,
+      .cullMode = lvk::CullMode_Back,
+      .debugName = "Pipeline: depth prepass trunk",
+  });
+
+  lvk::Holder<lvk::RenderPipelineHandle> pipelineDepthLeaf = ctx->createRenderPipeline({
+      .topology = lvk::Topology_TriangleStrip,
+      .smVert = smShadowLeafVert,
+      .smFrag = smShadowLeafFrag,
+      .depthFormat = lvk::Format_Z_F32,
+      .cullMode = lvk::CullMode_None,
+      .debugName = "Pipeline: depth prepass leaf",
   });
 
   // SSAO compute pipelines
@@ -1280,7 +2276,7 @@ VULKAN_APP_MAIN {
 
     // Compute tight ortho frustum from scene AABB in light-view space
     const vec3 sceneMin(-kFieldSize, -1.0f, -kFieldSize);
-    const vec3 sceneMax( kFieldSize,  2.0f,  kFieldSize);
+    const vec3 sceneMax( kFieldSize,  4.0f,  kFieldSize);
     vec3 lMin(FLT_MAX), lMax(-FLT_MAX);
     for (int i = 0; i < 8; i++) {
       const vec3 corner(
@@ -1397,6 +2393,34 @@ VULKAN_APP_MAIN {
           buffer.cmdPushConstants(shadowGrassPC);
           buffer.cmdDraw(kBladesPerStrip, kNumBlades);
         }
+
+        // Shadow trunk
+        {
+          buffer.cmdBindRenderPipeline(pipelineShadowTrunk);
+          const struct {
+            uint64_t perFrame;
+            uint64_t segmentData;
+          } pc = {
+              .perFrame = ctx->gpuAddress(bufPerFrameShadow),
+              .segmentData = ctx->gpuAddress(bufTrunkSegments),
+          };
+          buffer.cmdPushConstants(pc);
+          buffer.cmdDraw(kTrunkVertsPerSegment, totalTrunkSegments);
+        }
+
+        // Shadow leaves
+        {
+          buffer.cmdBindRenderPipeline(pipelineShadowLeaf);
+          const struct {
+            uint64_t perFrame;
+            uint64_t leafData;
+          } pc = {
+              .perFrame = ctx->gpuAddress(bufPerFrameShadow),
+              .leafData = ctx->gpuAddress(bufLeaves),
+          };
+          buffer.cmdPushConstants(pc);
+          buffer.cmdDraw(kLeafVerts, totalLeaves);
+        }
       }
       buffer.cmdEndRendering();
       buffer.transitionToShaderReadOnly(shadowMap);
@@ -1442,6 +2466,34 @@ VULKAN_APP_MAIN {
           };
           buffer.cmdPushConstants(depthGrassPC);
           buffer.cmdDraw(kBladesPerStrip, kNumBlades);
+        }
+
+        // Depth trunk
+        {
+          buffer.cmdBindRenderPipeline(pipelineDepthTrunk);
+          const struct {
+            uint64_t perFrame;
+            uint64_t segmentData;
+          } pc = {
+              .perFrame = ctx->gpuAddress(bufPerFrame),
+              .segmentData = ctx->gpuAddress(bufTrunkSegments),
+          };
+          buffer.cmdPushConstants(pc);
+          buffer.cmdDraw(kTrunkVertsPerSegment, totalTrunkSegments);
+        }
+
+        // Depth leaves
+        {
+          buffer.cmdBindRenderPipeline(pipelineDepthLeaf);
+          const struct {
+            uint64_t perFrame;
+            uint64_t leafData;
+          } pc = {
+              .perFrame = ctx->gpuAddress(bufPerFrame),
+              .leafData = ctx->gpuAddress(bufLeaves),
+          };
+          buffer.cmdPushConstants(pc);
+          buffer.cmdDraw(kLeafVerts, totalLeaves);
         }
       }
       buffer.cmdEndRendering();
@@ -1544,6 +2596,34 @@ VULKAN_APP_MAIN {
           };
           buffer.cmdPushConstants(grassPC);
           buffer.cmdDraw(kBladesPerStrip, kNumBlades);
+        }
+
+        // Draw tree trunks
+        {
+          buffer.cmdBindRenderPipeline(pipelineTrunk);
+          const struct {
+            uint64_t perFrame;
+            uint64_t segmentData;
+          } pc = {
+              .perFrame = ctx->gpuAddress(bufPerFrame),
+              .segmentData = ctx->gpuAddress(bufTrunkSegments),
+          };
+          buffer.cmdPushConstants(pc);
+          buffer.cmdDraw(kTrunkVertsPerSegment, totalTrunkSegments);
+        }
+
+        // Draw tree leaves
+        {
+          buffer.cmdBindRenderPipeline(pipelineLeaf);
+          const struct {
+            uint64_t perFrame;
+            uint64_t leafData;
+          } pc = {
+              .perFrame = ctx->gpuAddress(bufPerFrame),
+              .leafData = ctx->gpuAddress(bufLeaves),
+          };
+          buffer.cmdPushConstants(pc);
+          buffer.cmdDraw(kLeafVerts, totalLeaves);
         }
       }
       buffer.cmdEndRendering();
