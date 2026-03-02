@@ -1761,15 +1761,24 @@ VULKAN_APP_MAIN {
       growOak(base, trunkDir, trunkHeight, trunkRadius, 0, refRight);
     };
 
-    // --- PINE generator: conical shape with central leader + whorled horizontal branches ---
-    // --- MAPLE generator: medium tree, broad rounded canopy, layered branches ---
+    // --- MAPLE generator: early trunk fork, opposite branching (decussate), broad dome canopy ---
+    // Uses da Vinci's rule for radius tapering, crown envelope for dome shape,
+    // and leaf placement concentrated at the outer canopy shell.
     auto generateMaple = [&](vec3 base, float trunkHeight, float trunkRadius, vec3 trunkDir, vec3 refRight) {
       float tt = 1.0f;
-      std::function<void(vec3, vec3, float, float, int, vec3)> growMaple;
-      growMaple = [&](vec3 start, vec3 dir, float length, float radius, int depth, vec3 curRight) {
+      // Crown envelope: oblate dome (wider than tall)
+      float crownCenterY = base.y + trunkHeight * 0.6f;
+      float crownRadH = trunkHeight * 0.55f;
+      float crownRadV = trunkHeight * 0.40f;
+
+      std::function<void(vec3, vec3, float, float, int, vec3, float)> growMaple;
+      growMaple = [&](vec3 start, vec3 dir, float length, float radius, int depth, vec3 curRight, float parentRotBase) {
+        // Build branch cylinder segments
         int numSubSegs = (depth <= 1) ? 5 : 3;
+        float taper = (depth == 0) ? 0.88f : 0.72f;
+        float endRadius = radius * taper;
         float subLen = length / (float)numSubSegs;
-        float endRadius = radius * 0.65f;
+        curRight = glm::normalize(curRight - dir * glm::dot(curRight, dir));
         vec3 segStart = start;
         for (int s = 0; s < numSubSegs; s++) {
           float t0 = (float)s / (float)numSubSegs;
@@ -1783,47 +1792,102 @@ VULKAN_APP_MAIN {
           });
           segStart = segEnd;
         }
+        vec3 end = segStart;
 
-        int maxDepth = 4;
-        if (depth >= maxDepth) return;
-
-        // Spawn leaves from depth 2+ (broad canopy fill)
-        if (depth >= 2) {
-          vec3 leafCenter = start + dir * (length * 0.5f);
-          int leafCount = (depth >= 3) ? (60 + (int)(dist01(treeRng) * 40.0f)) : (30 + (int)(dist01(treeRng) * 20.0f));
-          float leafSpread = length * 0.6f;
-          spawnLeaves(leafCenter, leafCount, 0.03f, 0.02f, leafSpread, 0.333f, 0.333f, 1.0f);
+        // Leaves at depth >= 3 (outer canopy shell)
+        if (depth >= 3) {
+          int leafCount = (depth >= 4) ? (80 + (int)(dist01(treeRng) * 60.0f))
+                                       : (35 + (int)(dist01(treeRng) * 25.0f));
+          float leafSpread = length * 0.5f;
+          // Bias leaves outward from trunk center for shell distribution
+          vec3 horizOff = vec3(end.x - base.x, 0.0f, end.z - base.z);
+          float horizLen = glm::length(horizOff);
+          vec3 outDir = horizLen > 0.01f ? horizOff / horizLen : vec3(0.0f);
+          vec3 leafCenter = end + outDir * (leafSpread * 0.25f);
+          spawnLeaves(leafCenter, leafCount, 0.03f, 0.025f, leafSpread, 0.333f, 0.333f, 0.85f);
         }
 
-        // Branch into 2-3 children with wide spread (maple has broad canopy)
-        int numChildren = 2 + (dist01(treeRng) < 0.5f ? 1 : 0);
-        for (int c = 0; c < numChildren; c++) {
-          float childLen = length * (0.6f + dist01(treeRng) * 0.15f);
-          float childRadius = endRadius;
+        if (depth >= 5) return;
 
-          // Wide horizontal spread for broad rounded canopy
-          float spreadAngle = 0.35f + dist01(treeRng) * 0.40f;
-          float rotAngle = 6.2831853f * (float)c / (float)numChildren + (dist01(treeRng) - 0.5f) * 0.5f;
+        // Build local coordinate frame for branching
+        vec3 fwd = glm::normalize(dir);
+        vec3 rgt = glm::normalize(curRight - fwd * glm::dot(curRight, fwd));
+        vec3 upV = glm::normalize(glm::cross(fwd, rgt));
 
-          // Build child direction: spread from parent + slight upward bias
-          vec3 fwd = glm::normalize(dir);
-          vec3 rgt = glm::normalize(curRight - fwd * glm::dot(curRight, fwd));
-          vec3 upV = glm::normalize(glm::cross(fwd, rgt));
+        if (depth == 0) {
+          // Early trunk fork: 2-3 codominant stems (maple's signature low fork)
+          int numStems = 2 + (dist01(treeRng) < 0.35f ? 1 : 0);
+          float forkAngle = 0.40f + dist01(treeRng) * 0.20f; // ~23-34 degrees from trunk
+          float baseRot = distPhase(treeRng);
+          for (int i = 0; i < numStems; i++) {
+            float rotAngle = baseRot + 6.2831853f * (float)i / (float)numStems
+                             + (dist01(treeRng) - 0.5f) * 0.25f;
+            // Da Vinci's rule: child_r = parent_r / sqrt(N)
+            float childRadius = endRadius / sqrtf((float)numStems);
+            float childLen = length * (1.8f + dist01(treeRng) * 0.4f); // stems are longer than trunk section
 
-          vec3 childDir = fwd * cosf(spreadAngle) +
-                          (rgt * cosf(rotAngle) + upV * sinf(rotAngle)) * sinf(spreadAngle);
-          // Slight upward bias to keep canopy rounded
-          childDir.y += 0.15f;
-          childDir = glm::normalize(childDir);
+            vec3 childDir = fwd * cosf(forkAngle)
+                          + (rgt * cosf(rotAngle) + upV * sinf(rotAngle)) * sinf(forkAngle);
+            childDir.y += 0.15f; // upward bias
+            childDir = glm::normalize(childDir);
 
-          vec3 childRight = glm::normalize(rgt - childDir * glm::dot(rgt, childDir));
-          if (glm::length(childRight) < 0.001f) childRight = rgt;
+            vec3 childRight = glm::normalize(rgt - childDir * glm::dot(rgt, childDir));
+            if (glm::length(childRight) < 0.001f) childRight = rgt;
+            growMaple(end, childDir, childLen, childRadius, depth + 1, childRight, rotAngle);
+          }
+        } else {
+          // Opposite branching: 2 children at 180 degrees (decussate: rotated 90 from parent pair)
+          float branchAngle = 0.70f + dist01(treeRng) * 0.25f; // ~40-55 degrees from parent
+          // Decussate pattern: rotate 90 degrees from the previous branching plane
+          float rotBase = parentRotBase + 1.5708f + (dist01(treeRng) - 0.5f) * 0.2f;
 
-          growMaple(segStart, childDir, childLen, childRadius, depth + 1, childRight);
+          // How many total children (2 opposite + optional continuation)
+          bool hasContinuation = dist01(treeRng) < (0.7f - (float)depth * 0.12f);
+          int totalChildren = hasContinuation ? 3 : 2;
+          // Da Vinci's rule
+          float childRadius = endRadius / sqrtf((float)totalChildren);
+          float childLen = length * (0.65f + dist01(treeRng) * 0.10f);
+
+          for (int side = 0; side < 2; side++) {
+            float rotAngle = rotBase + 3.14159f * (float)side;
+
+            vec3 childDir = fwd * cosf(branchAngle)
+                          + (rgt * cosf(rotAngle) + upV * sinf(rotAngle)) * sinf(branchAngle);
+
+            // Crown envelope: gently steer branches back if they're near the dome edge
+            vec3 horizOff = vec3(end.x - base.x, 0.0f, end.z - base.z);
+            float outsideness = glm::length(horizOff) / crownRadH;
+            float aboveness = (end.y - crownCenterY) / crownRadV;
+            if (outsideness > 0.6f) {
+              childDir -= glm::normalize(horizOff) * (outsideness - 0.6f) * 0.4f;
+            }
+            if (aboveness > 0.5f) {
+              childDir.y -= (aboveness - 0.5f) * 0.3f;
+            }
+            childDir.y += 0.08f; // slight upward bias
+            childDir = glm::normalize(childDir);
+
+            vec3 childRight = glm::normalize(rgt - childDir * glm::dot(rgt, childDir));
+            if (glm::length(childRight) < 0.001f) childRight = rgt;
+            growMaple(end, childDir, childLen, childRadius, depth + 1, childRight, rotAngle);
+          }
+
+          // Optional continuation along parent direction
+          if (hasContinuation) {
+            vec3 contDir = fwd;
+            contDir.y += 0.05f;
+            contDir = glm::normalize(contDir);
+            float contLen = length * (0.55f + dist01(treeRng) * 0.10f);
+            vec3 contRight = glm::normalize(curRight - contDir * glm::dot(curRight, contDir));
+            if (glm::length(contRight) < 0.001f) contRight = curRight;
+            growMaple(end, contDir, contLen, childRadius, depth + 1, contRight, rotBase);
+          }
         }
       };
 
-      growMaple(base, trunkDir, trunkHeight, trunkRadius, 0, refRight);
+      // Start: short trunk (25% of height) before the first fork
+      float trunkPortion = trunkHeight * 0.25f;
+      growMaple(base, trunkDir, trunkPortion, trunkRadius, 0, refRight, 0.0f);
     };
 
     // --- BIRCH generator: tall thin trunk, drooping leaf clusters from depth 2+ ---
