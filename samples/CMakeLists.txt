@@ -37,4 +37,4 @@ endmacro()
 
 ADD_DEMO("GAME_TerrainRunner")
 ADD_DEMO("GAME_DungeonCrawler")
-ADD_DEMO("011_GrassField")
+ADD_DEMO("001_GrassField")
