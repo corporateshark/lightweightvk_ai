@@ -235,7 +235,7 @@ VULKAN_APP_MAIN {
       .debugName = "Pipeline: Terrain"
   };
   // Vertex input: binding 0, location 0, Float2 (x,z)
-  rpd.vertexInput.attributes[0] = {.location = 0, .binding = 0, .format = lvk::VertexFormat::Float2, .offset = 0};
+  rpd.vertexInput.attributes[0] = {.location = 0, .binding = 0, .format = lvk::VertexFormat_Float2, .offset = 0};
   rpd.vertexInput.inputBindings[0] = {.stride = (uint32_t)sizeof(VertexXZ)};
   lvk::Holder<lvk::RenderPipelineHandle> pipe = ctx->createRenderPipeline(rpd);
 
@@ -252,11 +252,11 @@ VULKAN_APP_MAIN {
   float fogDist = 120.0f;
   vec3 sunDir = normalize(vec3(0.6f, 0.8f, 0.2f));
 
-  app.run([&](uint32_t width, uint32_t height, float aspect, float deltaSeconds) {
+  app.run([&](ldr::Span<const RenderView> views, float deltaSeconds) {
     LVK_PROFILER_FUNCTION();
 
     const float fov = float(50.0f * (M_PI / 180.0f));
-    const mat4 mvp = glm::perspectiveLH_ZO(fov, aspect, 0.1f, 500.0f) * app.camera_.getViewMatrix();
+    const mat4 mvp = glm::perspectiveLH_ZO(fov, views[0].aspectRatio, 0.1f, 500.0f) * app.camera_.getViewMatrix();
     PushConstants pc{
         .mvp = mvp,
         .params = vec4((float)glfwGetTime(), amplitude, frequency, speed),
@@ -277,8 +277,8 @@ VULKAN_APP_MAIN {
         fb);
     {
       buffer.cmdBindRenderPipeline(pipe);
-      buffer.cmdBindViewport({0.0f, 0.0f, (float)width, (float)height, 0.0f, +1.0f});
-      buffer.cmdBindScissorRect({0, 0, (uint32_t)width, (uint32_t)height});
+		buffer.cmdBindViewport(views[0].viewport);
+		buffer.cmdBindScissorRect(views[0].scissorRect);
       buffer.cmdBindDepthState({.compareOp = lvk::CompareOp_Less, .isDepthWriteEnabled = true});
       buffer.cmdBindVertexBuffer(0, vb, 0);
       buffer.cmdBindIndexBuffer(ib, lvk::IndexFormat_UI32);

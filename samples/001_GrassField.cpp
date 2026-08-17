@@ -2276,8 +2276,12 @@ VULKAN_APP_MAIN {
   lvk::Holder<lvk::TextureHandle> ssaoBlurred;
   uint32_t msaaWidth = 0, msaaHeight = 0;
 
-  app.run([&](uint32_t width, uint32_t height, float aspectRatio, float deltaSeconds) {
+  app.run([&](ldr::Span<const RenderView> views, float deltaSeconds) {
     LVK_PROFILER_FUNCTION();
+
+    const float aspectRatio = views[0].aspectRatio;
+    const uint32_t width = views[0].scissorRect.width;
+    const uint32_t height = views[0].scissorRect.height;
 
     // Recreate MSAA textures on resize
     if (msaaWidth != width || msaaHeight != height) {
@@ -2412,8 +2416,7 @@ VULKAN_APP_MAIN {
       };
       buffer.cmdBindComputePipeline(pipelineWind);
       buffer.cmdPushConstants(windParams);
-      buffer.cmdDispatchThreadGroups(
-          {(kWindTexSize + 15) / 16, (kWindTexSize + 15) / 16, 1});
+      buffer.cmdDispatch({ (kWindTexSize + 15) / 16, (kWindTexSize + 15) / 16, 1 });
     }
 
     // 2. Shadow pass: render depth from light perspective
@@ -2426,7 +2429,7 @@ VULKAN_APP_MAIN {
               .color = {},
               .depth = {.loadOp = lvk::LoadOp_Clear, .storeOp = lvk::StoreOp_Store, .clearDepth = 1.0f}},
           shadowFramebuffer,
-          {.textures = {lvk::TextureHandle(windTexture)}});
+          {.sampledImages = {lvk::TextureHandle(windTexture)}});
       {
         buffer.cmdBindViewport({0.0f, 0.0f, (float)kShadowMapSize, (float)kShadowMapSize, 0.0f, +1.0f});
         buffer.cmdBindScissorRect({0, 0, kShadowMapSize, kShadowMapSize});
@@ -2487,7 +2490,7 @@ VULKAN_APP_MAIN {
         }
       }
       buffer.cmdEndRendering();
-      buffer.transitionToShaderReadOnly(shadowMap);
+      buffer.cmdTransitionToShaderReadOnly({ shadowMap }, {});
     }
 
     // 3. Depth prepass (1x, camera perspective — for SSAO)
@@ -2500,7 +2503,7 @@ VULKAN_APP_MAIN {
               .color = {},
               .depth = {.loadOp = lvk::LoadOp_Clear, .storeOp = lvk::StoreOp_Store, .clearDepth = 1.0f}},
           depthFB,
-          {.textures = {lvk::TextureHandle(windTexture)}});
+          {.sampledImages = {lvk::TextureHandle(windTexture)}});
       {
         buffer.cmdBindViewport({0.0f, 0.0f, (float)width, (float)height, 0.0f, +1.0f});
         buffer.cmdBindScissorRect({0, 0, width, height});
@@ -2561,7 +2564,7 @@ VULKAN_APP_MAIN {
         }
       }
       buffer.cmdEndRendering();
-      buffer.transitionToShaderReadOnly(ssaoDepthPrepass);
+      buffer.cmdTransitionToShaderReadOnly({ ssaoDepthPrepass }, {});
 
       // 4. SSAO compute
       {
@@ -2594,11 +2597,11 @@ VULKAN_APP_MAIN {
         };
         buffer.cmdBindComputePipeline(pipelineSSAO);
         buffer.cmdPushConstants(ssaoPC);
-        buffer.cmdDispatchThreadGroups({(width + 15) / 16, (height + 15) / 16, 1});
+        buffer.cmdDispatch({(width + 15) / 16, (height + 15) / 16, 1});
       }
 
       // 5. SSAO blur (reads ssaoRaw as sampled texture, writes ssaoBlurred as storage)
-      buffer.transitionToShaderReadOnly(ssaoRaw);
+      buffer.cmdTransitionToShaderReadOnly({ ssaoRaw }, {});
       {
         const struct {
           uint32_t texIn;
@@ -2615,7 +2618,7 @@ VULKAN_APP_MAIN {
         };
         buffer.cmdBindComputePipeline(pipelineSSAOBlur);
         buffer.cmdPushConstants(blurPC);
-        buffer.cmdDispatchThreadGroups({(width + 15) / 16, (height + 15) / 16, 1});
+        buffer.cmdDispatch({(width + 15) / 16, (height + 15) / 16, 1});
       }
     }
 
@@ -2627,10 +2630,10 @@ VULKAN_APP_MAIN {
       };
       buffer.cmdBeginRendering(
           lvk::RenderPass{
-              .color = {{.loadOp = lvk::LoadOp_Clear, .storeOp = lvk::StoreOp_MsaaResolve, .clearColor = {0.53f, 0.81f, 0.92f, 1.0f}}},
+              .color = {{.loadOp = lvk::LoadOp_Clear, .storeOp = lvk::StoreOp_DontCare, .clearColor = {0.53f, 0.81f, 0.92f, 1.0f}}},
               .depth = {.loadOp = lvk::LoadOp_Clear, .clearDepth = 1.0}},
           framebuffer,
-          {.textures = {lvk::TextureHandle(windTexture), ssaoEnabled ? lvk::TextureHandle(ssaoBlurred) : lvk::TextureHandle(whiteTex)}});
+          {.sampledImages = {lvk::TextureHandle(windTexture), ssaoEnabled ? lvk::TextureHandle(ssaoBlurred) : lvk::TextureHandle(whiteTex)}});
       {
         buffer.cmdBindViewport({0.0f, 0.0f, (float)width, (float)height, 0.0f, +1.0f});
         buffer.cmdBindScissorRect({0, 0, width, height});

@@ -94,10 +94,11 @@ VULKAN_APP_MAIN {
   const vec4 colWall  = vec4(0.30f, 0.30f, 0.34f, 1.0f);
   const vec4 colPlayer= vec4(0.90f, 0.80f, 0.20f, 1.0f);
 
-  app.run([&](uint32_t width, uint32_t height, float aspect, float /*deltaSeconds*/) {
+  app.run([&](ldr::Span<const RenderView> views, float /*deltaSeconds*/) {
     // Ortho: map coordinates in [0..W]x[0..H]; keep aspect by scaling view
     const float worldW = (float)W;
     const float worldH = (float)H;
+	 const float aspect = views[0].aspectRatio;
     // Fit world into viewport preserving aspect
     float targetAspect = worldW / worldH;
     float left, right, bottom, top;
@@ -116,8 +117,8 @@ VULKAN_APP_MAIN {
     buffer.cmdBeginRendering({.color = {{.loadOp = lvk::LoadOp_Clear, .storeOp = lvk::StoreOp_Store, .clearColor = {0.05f, 0.06f, 0.09f, 1.0f}}}},
                              {.color = {{.texture = ctx->getCurrentSwapchainTexture()}}});
     buffer.cmdBindRenderPipeline(pipe);
-    buffer.cmdBindViewport({0.0f, 0.0f, (float)width, (float)height, 0.0f, +1.0f});
-    buffer.cmdBindScissorRect({0, 0, width, height});
+	 buffer.cmdBindViewport(views[0].viewport);
+	 buffer.cmdBindScissorRect(views[0].scissorRect);
 
     auto drawQuad = [&](float cx, float cy, vec4 color, float sx = 1.0f, float sy = 1.0f) {
       mat4 model = glm::translate(mat4(1.0f), vec3(cx, cy, 0.0f));
